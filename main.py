@@ -7,7 +7,7 @@ app = Flask(__name__)
 
 BOT_TOKEN = "7386617987:AAGounvetKHtmtqCxEbY_Idc5M2IfUNSst4"
 API_KEY = "DaVkdyx2LrukvV1"  # Streamtape API Key
-USERNAME = "tapoj45295@forcrack.com"  # required for Streamtape
+USERNAME = "4694ed2e56e889559977"  # required for Streamtape
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 VALID_TOKEN = "12345678"  # Token for access control
