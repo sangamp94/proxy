@@ -1,117 +1,107 @@
-from flask import Flask, request
+# === app.py — Flask-based Pixeldrain uploader with video conversion ===
+from flask import Flask, request, jsonify
 import requests
+import subprocess
 import os
-from datetime import datetime, timedelta
+import shutil
+import mimetypes
+from datetime import datetime
 
 app = Flask(__name__)
 
-BOT_TOKEN = "7386617987:AAGounvetKHtmtqCxEbY_Idc5M2IfUNSst4"
-API_KEY = "DaVkdyx2LrukvV1"  # Streamtape API Key
-USERNAME = "4694ed2e56e889559977"  # Streamtape username
-API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+PIXELDRAIN_API_KEY = "4c407095-bec6-4fb3-acff-7d57003b5da8"
 
-VALID_TOKEN = "12345678"  # Token for access control
-user_tokens = {}
-last_upload_time = {}
-TOKEN_EXPIRY_HOURS = 5
-UPLOAD_COOLDOWN_MINUTES = 2
+# === Utility: Check for ffmpeg ===
+ffmpeg_path = shutil.which("ffmpeg")
+ffmpeg_available = bool(ffmpeg_path)
 
+@app.route("/upload", methods=["POST"])
+def upload():
+    data = request.get_json()
+    video_url = data.get("url")
 
-def send_message(chat_id, text):
-    requests.post(API_URL + "sendMessage", json={
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    })
+    if not video_url or not video_url.startswith("http"):
+        return jsonify({"error": "Invalid or missing video URL"}), 400
 
+    original = "original.mp4"
+    converted = "converted.mp4"
 
-def is_user_verified(chat_id):
-    expiry = user_tokens.get(chat_id)
-    return expiry and datetime.now() < expiry
+    print("📥 Downloading video...")
+    try:
+        r = requests.get(video_url, stream=True, timeout=60)
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type", "")
+        if "text" in content_type:
+            raise ValueError(f"Received non-video content (Content-Type: {content_type})")
 
+        with open(original, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+    except Exception as e:
+        return jsonify({"error": f"Failed to download: {str(e)}"}), 500
 
-def is_upload_allowed(chat_id):
-    last_time = last_upload_time.get(chat_id)
-    return not last_time or datetime.now() >= last_time + timedelta(minutes=UPLOAD_COOLDOWN_MINUTES)
-
-
-@app.route('/', methods=['POST'])
-def webhook():
-    update = request.get_json()
-    if not update:
-        return "No update received"
-
-    message = update.get("message")
-    if not message:
-        return "No message"
-
-    chat_id = message["chat"]["id"]
-    text = message.get("text")
-    video = message.get("video") or message.get("document")
-
-    if text and text.startswith("/start"):
-        send_message(chat_id, "👋 *Welcome to Video Upload 2 Bot!*\nUse `/token <your_token>` to unlock access.")
-        return "ok"
-
-    if text and text.startswith("/token"):
-        parts = text.split(" ", 1)
-        if len(parts) < 2:
-            send_message(chat_id, "❗ Usage: `/token <your_token>`")
-            return "ok"
-
-        input_token = parts[1].strip()
-        if input_token == VALID_TOKEN:
-            user_tokens[chat_id] = datetime.now() + timedelta(hours=TOKEN_EXPIRY_HOURS)
-            send_message(chat_id, f"✅ *Access granted for {TOKEN_EXPIRY_HOURS} hours!*")
-        else:
-            send_message(chat_id, "⛔ *Invalid token.*")
-        return "ok"
-
-    if text and text.startswith("/uploadurl"):
-        if not is_user_verified(chat_id):
-            send_message(chat_id, "⛔ *Access denied. Use `/token <your_token>` first.*")
-            return "ok"  # ✅ Prevents upload if not verified
-
-        if not is_upload_allowed(chat_id):
-            send_message(chat_id, f"⏳ Please wait before uploading again.")
-            return "ok"
-
-        parts = text.split(" ", 1)
-        if len(parts) < 2:
-            send_message(chat_id, "❗ Usage: `/uploadurl <video_url>`")
-            return "ok"
-
-        video_url = parts[1].strip()
-        if not video_url.startswith("http"):
-            send_message(chat_id, "❗ Invalid video URL.")
-            return "ok"
-
-        send_message(chat_id, "🔄 Uploading to *Streamtape*...")
-
+    # Convert if possible
+    if ffmpeg_available:
+        print("🎞️ Converting video with FFmpeg...")
         try:
-            response = requests.get(
-                f"https://api.streamtape.com/file/ul?login={USERNAME}&key={API_KEY}&url={video_url}",
-                timeout=20
-            ).json()
+            result = subprocess.run([
+                ffmpeg_path, "-y", "-i", original,
+                "-c:v", "libx264", "-c:a", "aac",
+                "-movflags", "+faststart",
+                converted
+            ], capture_output=True, text=True)
 
-            if response.get("status") == 200:
-                link = response["result"]["url"]
-                send_message(chat_id, f"✅ Uploaded!\n🔗 [Watch Now]({link})")
-                last_upload_time[chat_id] = datetime.now()
-            else:
-                send_message(chat_id, f"❌ Failed: {response.get('msg', 'Unknown error')}")
-
+            if result.returncode != 0:
+                print("❌ Conversion failed. Using original.")
+                converted = original
         except Exception as e:
-            send_message(chat_id, f"⚠️ Upload error: `{str(e)}`")
+            print(f"❌ Exception in conversion: {e}")
+            converted = original
+    else:
+        print("⚠️ FFmpeg not found. Skipping conversion.")
+        converted = original
 
-        return "ok"
+    # Upload to Pixeldrain
+    if not os.path.exists(converted):
+        return jsonify({"error": "No file to upload"}), 500
 
-    if video:
-        send_message(chat_id, "⛔ *Direct file upload is not supported in Streamtape.*\nUse `/uploadurl <video_url>`.")
-        return "ok"
+    mime_type, _ = mimetypes.guess_type(converted)
+    if not mime_type or not mime_type.startswith("video"):
+        return jsonify({"error": f"Not a video file (MIME: {mime_type})"}), 400
 
-    return "ok"
+    print("📤 Uploading to Pixeldrain...")
+    try:
+        with open(converted, "rb") as f:
+            response = requests.post(
+                "https://pixeldrain.com/api/file",
+                auth=('', PIXELDRAIN_API_KEY),
+                files={"file": f},
+                timeout=300
+            )
+        response.raise_for_status()
+        response_json = response.json()
 
+        if response_json.get("success"):
+            file_id = response_json.get("id")
+            return jsonify({"success": True, "link": f"https://pixeldrain.com/u/{file_id}"})
+        else:
+            return jsonify({"error": response_json}), 500
+
+    except Exception as e:
+        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
+
+    finally:
+        for f in [original, converted]:
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception as e:
+                    print(f"⚠️ Cleanup failed for {f}: {e}")
+
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ Pixeldrain uploader is running! Use POST /upload with JSON { 'url': '<video_url>' }"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
