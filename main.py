@@ -1,4 +1,4 @@
-# === app.py — Flask-based Pixeldrain uploader with video conversion ===
+# === main.py — Flask-based Pixeldrain uploader with video conversion ===
 from flask import Flask, request, jsonify
 import requests
 import subprocess
