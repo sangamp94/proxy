@@ -3,8 +3,8 @@ import requests
 import subprocess
 import os
 import shutil
-import mimetypes
 import time
+from yt_dlp import YoutubeDL
 
 app = Flask(__name__)
 
@@ -12,116 +12,95 @@ PIXELDRAIN_API_KEY = "4c407095-bec6-4fb3-acff-7d57003b5da8"
 ffmpeg_path = shutil.which("ffmpeg")
 ffmpeg_available = bool(ffmpeg_path)
 
-@app.route("/upload", methods=["POST"])
-def upload():
+@app.route("/upload_playlist", methods=["POST"])
+def upload_playlist():
     data = request.get_json()
-    video_url = data.get("url")
-    steps = {"download": None, "convert": None, "upload": None, "link": None}
+    playlist_url = data.get("playlist")
+
+    if not playlist_url or not playlist_url.startswith("http"):
+        return jsonify({"error": "Invalid playlist URL"}), 400
+
     start_time = time.time()
+    uploaded = []
+    failed = []
 
-    if not video_url or not video_url.startswith("http"):
-        return jsonify({"error": "Invalid or missing video URL"}), 400
+    ydl_opts = {
+        'quiet': True,
+        'extract_flat': 'in_playlist',
+        'dump_single_json': True,
+    }
 
-    original = "original.mp4"
-    converted = "converted.mp4"
-
-    print("📥 Downloading video...")
     try:
-        r = requests.get(video_url, stream=True, timeout=300)
-        r.raise_for_status()
-        content_type = r.headers.get("Content-Type", "")
-        if "text" in content_type:
-            raise ValueError(f"Received non-video content (Content-Type: {content_type})")
-
-        with open(original, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        steps["download"] = "done"
-        print("✅ Download complete")
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(playlist_url, download=False)
+            entries = info.get("entries", [])
     except Exception as e:
-        steps["download"] = f"failed: {str(e)}"
-        return jsonify({"steps": steps, "error": "Failed to download"}), 500
+        return jsonify({"error": f"❌ Failed to parse playlist: {e}"}), 500
 
-    if ffmpeg_available:
-        print("🎞️ Converting with FFmpeg...")
+    for entry in entries:
+        video_url = entry.get("url")
+        if not video_url:
+            continue
+
         try:
-            result = subprocess.run([
-                ffmpeg_path, "-y", "-i", original,
-                "-c:v", "libx264", "-c:a", "aac",
-                "-movflags", "+faststart",
-                converted
-            ], capture_output=True, text=True)
+            print(f"📥 Downloading: {video_url}")
+            subprocess.run([
+                "yt-dlp", "-f", "best[ext=mp4]/best",
+                "-o", "video.mp4", video_url
+            ], check=True)
 
-            if result.returncode == 0:
-                steps["convert"] = "done"
-                print("✅ Conversion complete")
-            else:
-                steps["convert"] = "failed, using original"
-                print("❌ Conversion failed. Using original.")
-                converted = original
-        except Exception as e:
-            steps["convert"] = f"exception: {e}, using original"
-            print(f"❌ Exception in conversion: {e}")
-            converted = original
-    else:
-        steps["convert"] = "skipped"
-        print("⚠️ FFmpeg not found. Skipping conversion.")
-        converted = original
+            file_path = "video.mp4"
+            upload_path = "converted.mp4" if ffmpeg_available else file_path
 
-    if not os.path.exists(converted):
-        steps["upload"] = "file missing"
-        return jsonify({"steps": steps, "error": "No file to upload"}), 500
-
-    mime_type, _ = mimetypes.guess_type(converted)
-    if not mime_type or not mime_type.startswith("video"):
-        steps["upload"] = f"invalid mime: {mime_type}"
-        return jsonify({"steps": steps, "error": "Not a video file"}), 400
-
-    print("📤 Uploading to Pixeldrain...")
-    try:
-        with open(converted, "rb") as f:
-            response = requests.post(
-                "https://pixeldrain.com/api/file",
-                auth=('', PIXELDRAIN_API_KEY),
-                files={"file": f},
-                timeout=300
-            )
-        response.raise_for_status()
-        response_json = response.json()
-
-        if response_json.get("success"):
-            file_id = response_json.get("id")
-            link = f"https://pixeldrain.com/u/{file_id}"
-            steps["upload"] = "done"
-            steps["link"] = link
-            print(f"✅ Upload complete: {link}")
-        else:
-            steps["upload"] = f"failed: {response_json.get('msg')}"
-            return jsonify({"steps": steps, "error": "Pixeldrain upload error"}), 500
-
-    except Exception as e:
-        steps["upload"] = f"exception: {str(e)}"
-        return jsonify({"steps": steps, "error": "Upload failed"}), 500
-
-    finally:
-        for f in [original, converted]:
-            if os.path.exists(f):
+            if ffmpeg_available:
                 try:
-                    os.remove(f)
+                    subprocess.run([
+                        ffmpeg_path, "-y", "-i", file_path,
+                        "-c:v", "libx264", "-c:a", "aac",
+                        "-movflags", "+faststart", upload_path
+                    ], check=True)
                 except Exception as e:
-                    print(f"⚠️ Cleanup failed: {e}")
+                    print("⚠️ FFmpeg failed. Using original file.")
+                    upload_path = file_path
 
-    duration = round(time.time() - start_time, 2)
-    return jsonify({"success": True, "steps": steps, "duration_sec": duration})
+            print("📤 Uploading to Pixeldrain...")
+            with open(upload_path, "rb") as f:
+                r = requests.post(
+                    "https://pixeldrain.com/api/file",
+                    auth=('', PIXELDRAIN_API_KEY),
+                    files={"file": f},
+                    timeout=300
+                )
+            response = r.json()
+            if response.get("success"):
+                uploaded.append({
+                    "video": video_url,
+                    "link": f"https://pixeldrain.com/u/{response['id']}"
+                })
+                print(f"✅ Uploaded: {response['id']}")
+            else:
+                failed.append({"video": video_url, "error": response.get("msg", "Upload error")})
+
+        except Exception as e:
+            failed.append({"video": video_url, "error": str(e)})
+            print(f"❌ Failed: {video_url} - {e}")
+
+        finally:
+            for f in ["video.mp4", "converted.mp4"]:
+                if os.path.exists(f):
+                    os.remove(f)
+
+    return jsonify({
+        "success": True,
+        "total": len(entries),
+        "uploaded": uploaded,
+        "failed": failed,
+        "duration_sec": round(time.time() - start_time, 2)
+    })
 
 @app.route("/", methods=["GET"])
 def home():
-    return "✅ Pixeldrain uploader is running!"
-
-@app.route("/favicon.ico")
-def favicon():
-    return '', 204
+    return "✅ Pixeldrain Playlist Uploader Running. POST to /upload_playlist with { 'playlist': 'YOUTUBE_PLAYLIST_URL' }"
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
