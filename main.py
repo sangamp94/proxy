@@ -4,7 +4,7 @@ from yt_dlp import YoutubeDL
 
 app = Flask(__name__)
 
-PIXELDRAIN_API_KEY = "4c407095-bec6-4fb3-acff-7d57003b5da8  # 🔒 Replace with yours
+PIXELDRAIN_API_KEY = "4c407095-bec6-4fb3-acff-7d57003b5da8"  # 🔒 Replace with yours
 ffmpeg_path = shutil.which("ffmpeg")
 ffmpeg_available = bool(ffmpeg_path)
 
