@@ -1,4 +1,6 @@
-flask
+Flask
+selenium
+webdriver-manager
 requests
 yt-dlp
-gunicorn
+
