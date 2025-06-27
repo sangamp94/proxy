@@ -1,119 +1,91 @@
 import os
 import time
+import shutil
 import requests
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-from yt_dlp import YoutubeDL
+from selenium.webdriver.common.by import By
 
 app = Flask(__name__)
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ----------- Setup Chrome Driver ----------
 def setup_driver():
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    service = Service(ChromeDriverManager().install())
-    return webdriver.Chrome(service=service, options=chrome_options)
+    prefs = {"download.default_directory": os.path.abspath(DOWNLOAD_DIR)}
+    chrome_options.add_experimental_option("prefs", prefs)
+    return webdriver.Chrome(executable_path=ChromeDriverManager().install(), options=chrome_options)
 
-# ----------- Extract video URLs from YouTube playlist ----------
-def extract_video_urls(playlist_url):
-    ydl_opts = {
-        'extract_flat': True,
-        'force_generic_extractor': False,
-        'quiet': True,
-        'dump_single_json': True
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(playlist_url, download=False)
-        return [entry['url'] for entry in info.get('entries', [])]
-
-# ----------- Download using PasteDownload ----------
-def download_video_via_pastedownload(video_url, driver):
+def get_download_link(driver, video_url):
     driver.get("https://pastedownload.com/youtube-video2-downloader/")
+    time.sleep(2)
     input_box = driver.find_element(By.ID, "sf_url")
     input_box.clear()
     input_box.send_keys(video_url)
     driver.find_element(By.ID, "sf_submit").click()
+    time.sleep(10)  # wait for download link to appear
+    try:
+        return driver.find_element(By.CSS_SELECTOR, "a.link-download").get_attribute("href")
+    except:
+        return None
 
-    time.sleep(7)  # Let the links load
-
-    links = driver.find_elements(By.XPATH, "//a[contains(@class, 'download-link')]")
-    for link in links:
-        href = link.get_attribute("href")
-        if href and "https" in href and (".mp4" in href or "video" in href):
-            filename = os.path.join(DOWNLOAD_DIR, "video_" + str(int(time.time())) + ".mp4")
-            print("Downloading:", href)
-            with open(filename, "wb") as f:
-                f.write(requests.get(href).content)
-            return filename
+def upload_to_pixeldrain(file_path):
+    with open(file_path, "rb") as f:
+        res = requests.post("https://pixeldrain.com/api/file", files={"file": f})
+    if res.ok:
+        return res.json().get("id")
     return None
 
-# ----------- Upload to Pixeldrain ----------
-def upload_to_pixeldrain(file_path):
-    with open(file_path, 'rb') as f:
-        response = requests.post('https://pixeldrain.com/api/file', files={'file': f})
-    return response.json().get("link", "")
+def process_video(video_url):
+    driver = setup_driver()
+    try:
+        print(f"[INFO] Processing: {video_url}")
+        dl_link = get_download_link(driver, video_url)
+        if not dl_link:
+            return f"[ERROR] Couldn't fetch download link for: {video_url}"
+        local_file = os.path.join(DOWNLOAD_DIR, "video.mp4")
+        with requests.get(dl_link, stream=True) as r:
+            with open(local_file, "wb") as f:
+                shutil.copyfileobj(r.raw, f)
+        pixeldrain_id = upload_to_pixeldrain(local_file)
+        os.remove(local_file)
+        return f"https://pixeldrain.com/u/{pixeldrain_id}" if pixeldrain_id else "[ERROR] Upload failed"
+    finally:
+        driver.quit()
 
-# ----------- Upload Playlist View ----------
 @app.route("/upload_playlist", methods=["GET", "POST"])
 def upload_playlist():
-    playlist_url = request.args.get("playlist") if request.method == "GET" else request.form.get("playlist")
-    if not playlist_url:
-        return jsonify({"error": "Missing playlist parameter"}), 400
+    playlist = request.args.get("playlist") or request.form.get("playlist")
+    if not playlist:
+        return "Missing 'playlist' parameter", 400
 
-    urls = extract_video_urls(playlist_url)
-    if not urls:
-        return jsonify({"error": "No videos found"}), 400
+    print(f"[INFO] Starting for playlist: {playlist}")
+    from yt_dlp import YoutubeDL
+    with YoutubeDL({"quiet": True}) as ydl:
+        playlist_info = ydl.extract_info(playlist, download=False)
+        video_urls = [entry["webpage_url"] for entry in playlist_info["entries"] if entry]
 
-    driver = setup_driver()
-    uploaded_links = []
+    results = []
+    for i in range(0, len(video_urls), 2):
+        group = video_urls[i:i+2]
+        for video_url in group:
+            results.append(process_video(video_url))
+        print("[INFO] Cleaned up batch\n")
+    return jsonify(results)
 
-    # 2 videos at a time
-    for i in range(0, len(urls), 2):
-        batch = urls[i:i+2]
-        local_files = []
-
-        for url in batch:
-            try:
-                file = download_video_via_pastedownload(url, driver)
-                if file:
-                    local_files.append(file)
-            except Exception as e:
-                print(f"Error downloading {url}: {e}")
-
-        for file in local_files:
-            try:
-                pixeldrain_url = upload_to_pixeldrain(file)
-                uploaded_links.append("https://pixeldrain.com/u/" + pixeldrain_url)
-            except Exception as e:
-                print(f"Error uploading {file}: {e}")
-            finally:
-                os.remove(file)
-
-    driver.quit()
-    return jsonify({"uploaded": uploaded_links})
-
-# ----------- Upload Form ----------
-@app.route("/upload_form")
-def upload_form():
-    return render_template_string('''
-    <form method="post" action="/upload_playlist">
-        <input type="text" name="playlist" placeholder="YouTube playlist URL" required>
-        <input type="submit" value="Start Upload">
-    </form>
-    ''')
-
-# ----------- Home ----------
-@app.route("/")
+@app.route("/", methods=["GET"])
 def index():
-    return "YouTube Playlist ➜ PasteDownload ➜ Pixeldrain Uploader"
+    return '''
+    <form method="post" action="/upload_playlist">
+        <input type="text" name="playlist" placeholder="YouTube Playlist URL" required />
+        <button type="submit">Start Upload</button>
+    </form>
+    '''
 
 if __name__ == "__main__":
-    app.run(debug=True, port=10000)
+    app.run(host="0.0.0.0", port=10000)
