@@ -18,6 +18,7 @@ HTML_FORM = '''
 {% if task_id %}
 <p>Status: <a href="/status/{{task_id}}" target="_blank">/status/{{task_id}}</a></p>
 {% endif %}
+<p>→ <a href="/upload_cookies" target="_blank">Upload cookies.txt</a></p>
 '''
 
 def extract_video_urls(playlist_url):
@@ -35,7 +36,9 @@ def download_video(video_url, output_dir):
         'outtmpl': f'{output_dir}/%(title).100s.%(ext)s',
         'format': 'best[ext=mp4]',
         'quiet': True,
-        'noplaylist': True
+        'noplaylist': True,
+        'cookies': 'cookies.txt',  # make sure this file exists
+        # 'proxy': 'http://your-french-proxy:port'  # optional
     }
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download([video_url])
@@ -64,12 +67,12 @@ def handle_task(task_id, playlist_url):
         chunk = urls[i:i+2]
         for video_url in chunk:
             try:
-                TASKS[task_id]["status"] = f"Downloading {video_url}"
+                TASKS[task_id]["status"] = f"Downloading: {video_url}"
                 download_video(video_url, task_dir)
 
                 for f in os.listdir(task_dir):
                     file_path = os.path.join(task_dir, f)
-                    TASKS[task_id]["status"] = f"Uploading {f}"
+                    TASKS[task_id]["status"] = f"Uploading: {f}"
                     link = upload_to_pixeldrain(file_path)
                     if link:
                         TASKS[task_id]["links"].append(link)
@@ -97,6 +100,20 @@ def status(task_id):
     if not task:
         return jsonify({"error": "Task not found"}), 404
     return jsonify(task)
+
+@app.route("/upload_cookies", methods=["GET", "POST"])
+def upload_cookies():
+    if request.method == "POST":
+        f = request.files['cookies']
+        f.save("cookies.txt")
+        return "✅ cookies.txt uploaded successfully!"
+    return '''
+    <h2>Upload YouTube cookies.txt</h2>
+    <form method="post" enctype="multipart/form-data">
+        <input type="file" name="cookies" required>
+        <button type="submit">Upload</button>
+    </form>
+    '''
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
