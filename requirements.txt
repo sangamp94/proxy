@@ -1,6 +1,3 @@
-Flask
-selenium
-webdriver-manager
+flask
 requests
-yt-dlp
-
+beautifulsoup4
