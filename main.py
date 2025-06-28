@@ -1,117 +1,85 @@
-import os, shutil, time, uuid
-from flask import Flask, request, jsonify, render_template_string
-from yt_dlp import YoutubeDL
+import os
+import time
+import shutil
 import requests
-from threading import Thread
+import yt_dlp
+from flask import Flask, request, jsonify
+from tempfile import mkdtemp
+
+PIXELDRAIN_API_KEY = "60022898-39c5-4a3c-a3c4-bbbccbde20ad"
+DOWNLOAD_DIR = mkdtemp()
 
 app = Flask(__name__)
-PIXELDRAIN_API_KEY = "60022898-39c5-4a3c-a3c4-bbbccbde20ad"
-TASKS = {}  # { task_id: {"status": ..., "links": [...]} }
-BASE_DIR = "/tmp"
-
-HTML_FORM = '''
-<h2>🎥 YouTube Playlist to Pixeldrain</h2>
-<form method="post">
-  <input name="playlist_url" placeholder="Paste YouTube playlist URL" size="60" required>
-  <button type="submit">Start</button>
-</form>
-{% if task_id %}
-<p>Status: <a href="/status/{{task_id}}" target="_blank">/status/{{task_id}}</a></p>
-{% endif %}
-<p>→ <a href="/upload_cookies" target="_blank">Upload cookies.txt</a></p>
-'''
-
-def extract_video_urls(playlist_url):
-    ydl_opts = {
-        'quiet': True,
-        'extract_flat': True,
-        'force_generic_extractor': True,
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(playlist_url, download=False)
-        return [entry['url'] for entry in info['entries'] if 'url' in entry]
-
-def download_video(video_url, output_dir):
-    ydl_opts = {
-        'outtmpl': f'{output_dir}/%(title).100s.%(ext)s',
-        'format': 'best[ext=mp4]',
-        'quiet': True,
-        'noplaylist': True,
-        'cookies': 'cookies.txt',  # make sure this file exists
-        # 'proxy': 'http://your-french-proxy:port'  # optional
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([video_url])
 
 def upload_to_pixeldrain(file_path):
-    with open(file_path, 'rb') as f:
+    with open(file_path, "rb") as f:
         response = requests.post(
-            'https://pixeldrain.com/api/file',
-            headers={'Authorization': f'Bearer {PIXELDRAIN_API_KEY}'},
-            files={'file': f}
+            "https://pixeldrain.com/api/file",
+            headers={"Authorization": f"Bearer {PIXELDRAIN_API_KEY}"},
+            files={"file": f}
         )
-        if response.status_code == 200:
-            file_id = response.json().get("id")
-            return f"https://pixeldrain.com/u/{file_id}"
-        else:
-            print("Upload failed:", response.text)
-            return None
+    if response.ok:
+        return "https://pixeldrain.com/u/" + response.json()["id"]
+    return None
 
-def handle_task(task_id, playlist_url):
-    task_dir = os.path.join(BASE_DIR, f"task_{task_id}")
-    os.makedirs(task_dir, exist_ok=True)
-    TASKS[task_id]["status"] = "Extracting playlist..."
-    urls = extract_video_urls(playlist_url)
+def get_video_urls(playlist_url):
+    ydl_opts = {
+        "extract_flat": True,
+        "quiet": True,
+        "skip_download": True,
+        "forcejson": True,
+    }
+    result = []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(playlist_url, download=False)
+        for entry in info.get("entries", []):
+            result.append(entry["url"])
+    return result
 
+def download_video(url, output_dir):
+    ydl_opts = {
+        "quiet": True,
+        "outtmpl": os.path.join(output_dir, "%(title).80s.%(ext)s"),
+        "format": "mp4",
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info)
+
+def process_playlist(playlist_url):
+    urls = get_video_urls(playlist_url)
+    pixeldrain_links = []
     for i in range(0, len(urls), 2):
-        chunk = urls[i:i+2]
-        for video_url in chunk:
+        chunk = urls[i:i + 2]
+        for url in chunk:
             try:
-                TASKS[task_id]["status"] = f"Downloading: {video_url}"
-                download_video(video_url, task_dir)
-
-                for f in os.listdir(task_dir):
-                    file_path = os.path.join(task_dir, f)
-                    TASKS[task_id]["status"] = f"Uploading: {f}"
-                    link = upload_to_pixeldrain(file_path)
-                    if link:
-                        TASKS[task_id]["links"].append(link)
-                    os.remove(file_path)
+                print(f"Downloading: {url}")
+                file_path = download_video(url, DOWNLOAD_DIR)
+                print(f"Uploading: {file_path}")
+                link = upload_to_pixeldrain(file_path)
+                if link:
+                    pixeldrain_links.append(link)
+                os.remove(file_path)
             except Exception as e:
-                TASKS[task_id]["status"] = f"Error: {e}"
-        time.sleep(1)
+                print(f"Error: {e}")
+        time.sleep(1)  # short delay to avoid rate limits
+    return pixeldrain_links
 
-    shutil.rmtree(task_dir)
-    TASKS[task_id]["status"] = "✅ Done"
+@app.route("/", methods=["POST"])
+def handle():
+    data = request.form
+    playlist_url = data.get("playlist")
+    if not playlist_url:
+        return "Missing playlist URL", 400
+    links = process_playlist(playlist_url)
+    return jsonify({"links": links})
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    if request.method == "POST":
-        playlist_url = request.form["playlist_url"]
-        task_id = str(uuid.uuid4())[:8]
-        TASKS[task_id] = {"status": "Starting...", "links": []}
-        Thread(target=handle_task, args=(task_id, playlist_url)).start()
-        return render_template_string(HTML_FORM, task_id=task_id)
-    return render_template_string(HTML_FORM, task_id=None)
-
-@app.route("/status/<task_id>")
-def status(task_id):
-    task = TASKS.get(task_id)
-    if not task:
-        return jsonify({"error": "Task not found"}), 404
-    return jsonify(task)
-
-@app.route("/upload_cookies", methods=["GET", "POST"])
-def upload_cookies():
-    if request.method == "POST":
-        f = request.files['cookies']
-        f.save("cookies.txt")
-        return "✅ cookies.txt uploaded successfully!"
+@app.route("/upload_form")
+def upload_form():
     return '''
-    <h2>Upload YouTube cookies.txt</h2>
-    <form method="post" enctype="multipart/form-data">
-        <input type="file" name="cookies" required>
-        <button type="submit">Upload</button>
+    <form method="post" action="/">
+      Playlist URL: <input name="playlist" size="80"><br>
+      <input type="submit">
     </form>
     '''
 
