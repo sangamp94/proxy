@@ -1,36 +1,42 @@
 import re
 import json
 import requests
+import http.cookiejar
 from bs4 import BeautifulSoup
+from flask import Flask, send_file
 from urllib.parse import urljoin
 
+app = Flask(__name__)
 BASE_URL = "https://netfree2.cc/mobile/"
-COOKIES = {
-    "addhash": "0e820a116d8b179da9352a14c0565d4a::cc7d978d870ea795fbf8e189078b382d::1751194708"
-}
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Cookie": f"addhash={COOKIES['addhash']}"
-}
+def load_cookies_from_file(path="cookies.txt"):
+    cj = http.cookiejar.MozillaCookieJar()
+    try:
+        cj.load(path, ignore_discard=True, ignore_expires=True)
+        return cj
+    except Exception as e:
+        print(f"❌ Failed to load cookies from {path}: {e}")
+        return None
 
+def get_all_playlists(session):
+    url = urljoin(BASE_URL, "playlist.php")
+    res = session.get(url)
+    if res.status_code != 200:
+        print(f"❌ Error fetching playlist.php: {res.status_code}")
+        return []
 
-def get_all_playlists():
-    url = urljoin(BASE_URL, "index.php")
-    res = requests.get(url, headers=HEADERS)
     soup = BeautifulSoup(res.text, "html.parser")
-
     playlists = []
     for a in soup.find_all("a", href=True):
         if "playlist.php?id=" in a["href"]:
             title = a.get_text(strip=True)
             full_url = urljoin(BASE_URL, a["href"])
             playlists.append((title, full_url))
+    print(f"✅ Found {len(playlists)} playlists.")
     return playlists
 
-
-def get_all_video_links(playlist_url):
-    res = requests.get(playlist_url, headers=HEADERS)
+def get_all_video_links(session, playlist_url):
+    res = session.get(playlist_url)
     soup = BeautifulSoup(res.text, "html.parser")
 
     links = []
@@ -39,45 +45,54 @@ def get_all_video_links(playlist_url):
             links.append(urljoin(BASE_URL, a["href"]))
     return links
 
-
 def extract_player_json(html_text):
-    match = re.search(r'var\s+playerInstance\s*=\s*jwplayer\("player"\)\.setup\((\[\{.+?\}\])\);', html_text, re.DOTALL)
+    match = re.search(
+        r'var\s+playerInstance\s*=\s*jwplayer\("player"\)\.setup\((\[\{.+?\}\])\);',
+        html_text, re.DOTALL
+    )
     if match:
         json_text = match.group(1)
         try:
             return json.loads(json_text)
         except json.JSONDecodeError:
-            print("Failed to parse JSON")
+            print("⚠️ JSON parsing error.")
     return None
 
+@app.route("/scrape")
+def scrape():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0"
+    })
 
-def main():
+    cookies = load_cookies_from_file("cookies.txt")
+    if not cookies:
+        return "❌ Cookie load failed", 500
+
+    session.cookies = cookies
     result = []
 
-    playlists = get_all_playlists()
-    print(f"Found {len(playlists)} playlists...")
-
-    for playlist_title, playlist_url in playlists:
-        print(f"Processing playlist: {playlist_title}")
-        video_links = get_all_video_links(playlist_url)
-
+    playlists = get_all_playlists(session)
+    for title, url in playlists:
+        print(f"\n🎬 Playlist: {title}")
+        video_links = get_all_video_links(session, url)
         for video_url in video_links:
             try:
-                r = requests.get(video_url, headers=HEADERS)
+                r = session.get(video_url)
                 player_data = extract_player_json(r.text)
-
                 if player_data:
                     result.extend(player_data)
-                else:
-                    print(f"⚠️ Could not extract player JSON from: {video_url}")
             except Exception as e:
                 print(f"❌ Error on {video_url}: {e}")
 
     with open("netfree2_export.json", "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
 
-    print(f"\n✅ Done. Exported {len(result)} entries to netfree2_export.json")
+    return send_file("netfree2_export.json", as_attachment=True)
 
+@app.route("/")
+def index():
+    return "<h2>NetFree2 Scraper</h2><p><a href='/scrape'>Click to export all NetFree2 videos JSON</a></p>"
 
 if __name__ == "__main__":
-    main()
+    app.run(host="0.0.0.0", port=10000)
