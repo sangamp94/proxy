@@ -1,43 +1,54 @@
 from flask import Flask, Response
 import requests
+from urllib.parse import urljoin
 
 app = Flask(__name__)
 
-# Replace this with the actual M3U8 or .php?id=... generator
-SOURCE_URL = "https://uxplaylists-live.vercel.app/uiop.php?id=56032"
+# Your original source (master playlist)
+MASTER_M3U8 = "https://uxplaylists-live.vercel.app/uiop.php?id=56032"
 
 @app.route("/")
-def home():
-    return (
-        "Use this endpoint in VLC:<br><br>"
-        f"<code>/live/stream.m3u8</code><br><br>"
-        f"Example: <code>https://your-app.onrender.com/live/stream.m3u8</code>"
-    )
+def index():
+    return "Use /live/stream.m3u8 in VLC"
 
 @app.route("/live/stream.m3u8")
-def serve_m3u8():
+def serve_stream():
     try:
-        # Fetch M3U8 playlist (supports redirect)
-        r = requests.get(SOURCE_URL, timeout=10, allow_redirects=True)
-        if r.status_code != 200:
-            return f"Failed to fetch M3U8: HTTP {r.status_code}", 500
+        # Step 1: Get master playlist (contains links to media playlists)
+        master_resp = requests.get(MASTER_M3U8, timeout=10, allow_redirects=True)
+        if master_resp.status_code != 200:
+            return "Failed to fetch master playlist", 500
 
-        # Extract base URL to resolve .ts segments
-        real_url = r.url
-        base_url = real_url.rsplit("/", 1)[0]
+        master_lines = master_resp.text.splitlines()
+        media_relative_url = None
 
-        playlist = r.text
-        output = []
+        for line in master_lines:
+            if line and not line.startswith("#"):
+                media_relative_url = line.strip()
+                break  # Just use the first stream
 
-        for line in playlist.splitlines():
+        if not media_relative_url:
+            return "Media playlist not found", 500
+
+        media_playlist_url = urljoin(master_resp.url, media_relative_url)
+
+        # Step 2: Fetch media playlist (contains .ts segments)
+        media_resp = requests.get(media_playlist_url, timeout=10)
+        if media_resp.status_code != 200:
+            return "Failed to fetch media playlist", 500
+
+        media_lines = media_resp.text.splitlines()
+        base_url = media_playlist_url.rsplit("/", 1)[0]
+
+        final_playlist = []
+        for line in media_lines:
             if line.strip().endswith(".ts"):
-                # Turn relative .ts path into absolute
-                full_url = f"{base_url}/{line.strip()}"
-                output.append(full_url)
+                ts_url = urljoin(base_url + "/", line.strip())
+                final_playlist.append(ts_url)
             else:
-                output.append(line)
+                final_playlist.append(line)
 
-        return Response("\n".join(output), content_type="application/vnd.apple.mpegurl")
+        return Response("\n".join(final_playlist), content_type="application/vnd.apple.mpegurl")
 
     except Exception as e:
         return f"Error: {str(e)}", 500
