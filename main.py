@@ -1,98 +1,46 @@
-import re
-import json
+from flask import Flask, Response
 import requests
-import http.cookiejar
-from bs4 import BeautifulSoup
-from flask import Flask, send_file
-from urllib.parse import urljoin
 
 app = Flask(__name__)
-BASE_URL = "https://netfree2.cc/mobile/"
 
-def load_cookies_from_file(path="cookies.txt"):
-    cj = http.cookiejar.MozillaCookieJar()
-    try:
-        cj.load(path, ignore_discard=True, ignore_expires=True)
-        return cj
-    except Exception as e:
-        print(f"❌ Failed to load cookies from {path}: {e}")
-        return None
-
-def get_all_playlists(session):
-    url = urljoin(BASE_URL, "playlist.php")
-    res = session.get(url)
-    if res.status_code != 200:
-        print(f"❌ Error fetching playlist.php: {res.status_code}")
-        return []
-
-    soup = BeautifulSoup(res.text, "html.parser")
-    playlists = []
-    for a in soup.find_all("a", href=True):
-        if "playlist.php?id=" in a["href"]:
-            title = a.get_text(strip=True)
-            full_url = urljoin(BASE_URL, a["href"])
-            playlists.append((title, full_url))
-    print(f"✅ Found {len(playlists)} playlists.")
-    return playlists
-
-def get_all_video_links(session, playlist_url):
-    res = session.get(playlist_url)
-    soup = BeautifulSoup(res.text, "html.parser")
-
-    links = []
-    for a in soup.find_all("a", href=True):
-        if "view.php?id=" in a["href"]:
-            links.append(urljoin(BASE_URL, a["href"]))
-    return links
-
-def extract_player_json(html_text):
-    match = re.search(
-        r'var\s+playerInstance\s*=\s*jwplayer\("player"\)\.setup\((\[\{.+?\}\])\);',
-        html_text, re.DOTALL
-    )
-    if match:
-        json_text = match.group(1)
-        try:
-            return json.loads(json_text)
-        except json.JSONDecodeError:
-            print("⚠️ JSON parsing error.")
-    return None
-
-@app.route("/scrape")
-def scrape():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0"
-    })
-
-    cookies = load_cookies_from_file("cookies.txt")
-    if not cookies:
-        return "❌ Cookie load failed", 500
-
-    session.cookies = cookies
-    result = []
-
-    playlists = get_all_playlists(session)
-    for title, url in playlists:
-        print(f"\n🎬 Playlist: {title}")
-        video_links = get_all_video_links(session, url)
-        for video_url in video_links:
-            try:
-                r = session.get(video_url)
-                player_data = extract_player_json(r.text)
-                if player_data:
-                    result.extend(player_data)
-            except Exception as e:
-                print(f"❌ Error on {video_url}: {e}")
-
-    with open("netfree2_export.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
-
-    return send_file("netfree2_export.json", as_attachment=True)
+# Replace this with the actual M3U8 or .php?id=... generator
+SOURCE_URL = "https://uxplaylists-live.vercel.app/uiop.php?id=56032"
 
 @app.route("/")
-def index():
-    return "<h2>NetFree2 Scraper</h2><p><a href='/scrape'>Click to export all NetFree2 videos JSON</a></p>"
+def home():
+    return (
+        "Use this endpoint in VLC:<br><br>"
+        f"<code>/live/stream.m3u8</code><br><br>"
+        f"Example: <code>https://your-app.onrender.com/live/stream.m3u8</code>"
+    )
+
+@app.route("/live/stream.m3u8")
+def serve_m3u8():
+    try:
+        # Fetch M3U8 playlist (supports redirect)
+        r = requests.get(SOURCE_URL, timeout=10, allow_redirects=True)
+        if r.status_code != 200:
+            return f"Failed to fetch M3U8: HTTP {r.status_code}", 500
+
+        # Extract base URL to resolve .ts segments
+        real_url = r.url
+        base_url = real_url.rsplit("/", 1)[0]
+
+        playlist = r.text
+        output = []
+
+        for line in playlist.splitlines():
+            if line.strip().endswith(".ts"):
+                # Turn relative .ts path into absolute
+                full_url = f"{base_url}/{line.strip()}"
+                output.append(full_url)
+            else:
+                output.append(line)
+
+        return Response("\n".join(output), content_type="application/vnd.apple.mpegurl")
+
+    except Exception as e:
+        return f"Error: {str(e)}", 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
