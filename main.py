@@ -1,71 +1,53 @@
-from flask import Flask, Response, request
+from flask import Flask, request, Response, render_template_string
 import requests
-from urllib.parse import urljoin
 
 app = Flask(__name__)
-
-# Your master .m3u8 playlist (returns a master playlist pointing to media playlist)
-MASTER_M3U8 = "https://uxplaylists-live.vercel.app/uiop.php?id=56032"
-MEDIA_PLAYLIST_URL = None  # to be set dynamically at runtime
+REMOTE_BASE = ""  # Global base for .ts files
 
 @app.route("/")
 def home():
-    return "Paste <code>/live/stream.m3u8</code> into VLC"
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Restream Player</title>
+      <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    </head>
+    <body>
+      <h2>Restreamed M3U8 Stream</h2>
+      <video id="video" width="100%" height="auto" controls autoplay></video>
+      <script>
+        if(Hls.isSupported()) {
+          var video = document.getElementById('video');
+          var hls = new Hls();
+          hls.loadSource('/stream.m3u8');
+          hls.attachMedia(video);
+          hls.on(Hls.Events.MANIFEST_PARSED,function() {
+            video.play();
+          });
+        }
+      </script>
+    </body>
+    </html>
+    """)
 
-@app.route("/live/stream.m3u8")
-def stream():
-    global MEDIA_PLAYLIST_URL
+@app.route("/stream.m3u8")
+def proxy_m3u8():
+    global REMOTE_BASE
+    url = request.args.get("url") or "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+    REMOTE_BASE = url.rsplit("/", 1)[0]
+    r = requests.get(url)
+    data = r.text
+    # Rewrite .ts segment paths to hit our proxy
+    data = data.replace(".ts", ".ts-proxy")
+    return Response(data, content_type="application/vnd.apple.mpegurl")
 
-    try:
-        # Step 1: Fetch master playlist
-        master = requests.get(MASTER_M3U8, allow_redirects=True, timeout=10)
-        if master.status_code != 200:
-            return "Failed to fetch master playlist", 500
-
-        # Step 2: Extract first media playlist URL
-        media_rel_url = next((l.strip() for l in master.text.splitlines() if l and not l.startswith("#")), None)
-        if not media_rel_url:
-            return "No media playlist found", 500
-
-        MEDIA_PLAYLIST_URL = urljoin(master.url, media_rel_url)
-
-        # Step 3: Fetch media playlist
-        media = requests.get(MEDIA_PLAYLIST_URL, timeout=10)
-        if media.status_code != 200:
-            return "Failed to fetch media playlist", 500
-
-        base_url = MEDIA_PLAYLIST_URL.rsplit("/", 1)[0]
-
-        # Step 4: Rewrite .ts lines to use /ts_proxy
-        modified_lines = []
-        for line in media.text.splitlines():
-            if line.strip().endswith(".ts"):
-                segment = line.strip()
-                modified_lines.append(f"/live/ts_proxy?segment={segment}")
-            else:
-                modified_lines.append(line)
-
-        return Response("\n".join(modified_lines), content_type="application/vnd.apple.mpegurl")
-
-    except Exception as e:
-        return f"Error: {str(e)}", 500
-
-
-@app.route("/live/ts_proxy")
-def ts_proxy():
-    segment = request.args.get("segment")
-    if not segment or not MEDIA_PLAYLIST_URL:
-        return "Missing segment or base URL", 400
-
-    base_url = MEDIA_PLAYLIST_URL.rsplit("/", 1)[0]
-    ts_url = urljoin(base_url + "/", segment)
-
-    try:
-        r = requests.get(ts_url, stream=True)
-        return Response(r.iter_content(1024), content_type="video/MP2T")
-    except Exception as e:
-        return f"Failed to fetch .ts: {str(e)}", 500
-
+@app.route("/<segment>.ts-proxy")
+def proxy_ts(segment):
+    global REMOTE_BASE
+    ts_url = f"{REMOTE_BASE}/{segment}.ts"
+    r = requests.get(ts_url, stream=True)
+    return Response(r.iter_content(chunk_size=1024), content_type="video/MP2T")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
