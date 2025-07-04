@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><title>Unlock Playlist</title></head>
+<body>
+    <h2>Unlock IPTV Access</h2>
+    <form method="POST">
+        <button type="submit">Unlock Now</button>
+    </form>
+    {% if token %}
+        <p>Your Token: <strong>{{ token }}</strong></p>
+        <p>Use: <code>iptvplaylist.m3u?token={{ token }}</code></p>
+    {% endif %}
+</body>
+</html>
