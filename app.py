@@ -1,4 +1,3 @@
-# app.py
 from flask import Flask, request, redirect, render_template, session, url_for, send_file, abort, flash
 from functools import wraps
 from datetime import datetime, timedelta
@@ -69,6 +68,7 @@ def logout():
 def admin():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
+
         if request.method == 'POST':
             if 'add_token' in request.form:
                 token = request.form['token']
@@ -76,10 +76,36 @@ def admin():
                 expiry = (datetime.utcnow() + timedelta(days=days)).isoformat()
                 c.execute('INSERT OR REPLACE INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'admin'))
                 conn.commit()
+
             elif 'add_channel' in request.form:
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
                           (request.form['name'], request.form['stream'], request.form['logo']))
                 conn.commit()
+
+            elif 'upload_m3u' in request.form and 'm3ufile' in request.files:
+                m3ufile = request.files['m3ufile']
+                if m3ufile.filename.endswith('.m3u'):
+                    lines = m3ufile.read().decode('utf-8').splitlines()
+                    name, logo, url = None, '', ''
+                    for line in lines:
+                        if line.startswith('#EXTINF:'):
+                            try:
+                                parts = line.split(',', 1)
+                                name = parts[1].strip()
+                                logo_part = line.split('tvg-logo="')
+                                if len(logo_part) > 1:
+                                    logo = logo_part[1].split('"')[0]
+                                else:
+                                    logo = ''
+                            except:
+                                continue
+                        elif line.startswith('http'):
+                            url = line.strip()
+                            if name and url:
+                                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
+                                          (name, url, logo))
+                                name, logo, url = None, '', ''
+                    conn.commit()
 
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
@@ -87,7 +113,7 @@ def admin():
         for t in tokens:
             c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (t[0],))
             ip_count = c.fetchone()[0]
-            token_data.append((t[0], t[1], ip_count, t[2], t[3]))  # includes created_by
+            token_data.append((t[0], t[1], ip_count, t[2], t[3]))
         c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100')
         logs = c.fetchall()
         c.execute('SELECT * FROM channels')
@@ -143,7 +169,6 @@ def playlist():
         if banned or expiry_time < now:
             return abort(403, 'Token Expired or Banned')
 
-        # Device limit check
         c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,))
         count = c.fetchone()[0]
         c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip))
@@ -155,16 +180,13 @@ def playlist():
                 return abort(403, 'Device limit exceeded. Token banned.')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
-        # Log access
         c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
                   (now.isoformat(), ip, token, ua, ref))
 
-        # Fetch channels
         c.execute('SELECT name, stream_url, logo_url FROM channels')
         channels = c.fetchall()
         conn.commit()
 
-    # Generate playlist
     lines = ['#EXTM3U']
     for name, url, logo in channels:
         lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
