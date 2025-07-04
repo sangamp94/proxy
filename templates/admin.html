@@ -134,6 +134,7 @@
               <a href="/admin/action/{{ token }}/reset" class="btn btn-sm btn-warning mb-1">Reset IPs</a>
               <a href="/admin/action/{{ token }}/renew" class="btn btn-sm btn-info mb-1">Renew</a>
               <a href="/admin/action/{{ token }}/ban" class="btn btn-sm btn-secondary mb-1">Ban</a>
+              <a href="/iptvplaylist.m3u?token={{ token }}" class="btn btn-sm btn-success mb-1" download="{{ token }}.m3u">Download</a>
             </td>
           </tr>
           {% endfor %}
