@@ -1,7 +1,7 @@
 from flask import Flask, request, redirect, render_template, session, abort
 from functools import wraps
 from datetime import datetime, timedelta
-import sqlite3, os, uuid
+import sqlite3, os, uuid, requests
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
@@ -85,26 +85,19 @@ def admin():
                 m3ufile = request.files['m3ufile']
                 if m3ufile.filename.endswith('.m3u'):
                     lines = m3ufile.read().decode('utf-8').splitlines()
-                    name, logo, url = None, '', ''
-                    for line in lines:
-                        if line.startswith('#EXTINF:'):
-                            try:
-                                parts = line.split(',', 1)
-                                name = parts[1].strip()
-                                logo_part = line.split('tvg-logo="')
-                                if len(logo_part) > 1:
-                                    logo = logo_part[1].split('"')[0]
-                                else:
-                                    logo = ''
-                            except:
-                                continue
-                        elif line.startswith('http'):
-                            url = line.strip()
-                            if name and url:
-                                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
-                                          (name, url, logo))
-                                name, logo, url = None, '', ''
+                    parse_m3u_lines(lines, c)
                     conn.commit()
+
+            elif 'm3u_url' in request.form:
+                m3u_url = request.form['m3u_url']
+                try:
+                    res = requests.get(m3u_url)
+                    if res.status_code == 200:
+                        lines = res.text.splitlines()
+                        parse_m3u_lines(lines, c)
+                        conn.commit()
+                except:
+                    pass
 
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
@@ -118,6 +111,26 @@ def admin():
         c.execute('SELECT * FROM channels')
         channels = c.fetchall()
         return render_template('admin.html', tokens=token_data, logs=logs, channels=channels)
+
+def parse_m3u_lines(lines, c):
+    name, logo, url = None, '', ''
+    for line in lines:
+        if line.startswith('#EXTINF:'):
+            try:
+                parts = line.split(',', 1)
+                name = parts[1].strip()
+                logo_part = line.split('tvg-logo="')
+                if len(logo_part) > 1:
+                    logo = logo_part[1].split('"')[0]
+                else:
+                    logo = ''
+            except:
+                continue
+        elif line.startswith('http'):
+            url = line.strip()
+            if name and url:
+                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
+                name, logo, url = None, '', ''
 
 @app.route('/admin/action/<token>/<action>')
 @login_required
