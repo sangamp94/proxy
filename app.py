@@ -1,14 +1,14 @@
-from flask import Flask, request, redirect, render_template, session, abort, flash
+from flask import Flask, request, redirect, render_template, session, abort
 from functools import wraps
 from datetime import datetime, timedelta
-import sqlite3, os, uuid, requests
+import sqlite3, os, uuid
 
 app = Flask(__name__)
-app.secret_key = 'supersecretkey'  # Replace in production
+app.secret_key = 'supersecretkey'
 DB = 'database.db'
 MAX_DEVICES = 4
 
-# ----- DB SETUP -----
+# DB Initialization
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -39,7 +39,7 @@ def init_db():
 
 init_db()
 
-# ----- AUTH -----
+# Auth Decorator
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -62,7 +62,6 @@ def logout():
     session.pop('admin', None)
     return redirect('/login')
 
-# ----- ADMIN PANEL -----
 @app.route('/admin', methods=['GET', 'POST'])
 @login_required
 def admin():
@@ -107,36 +106,6 @@ def admin():
                                 name, logo, url = None, '', ''
                     conn.commit()
 
-            elif 'upload_m3u_url' in request.form:
-                m3u_url = request.form.get('m3u_url')
-                if m3u_url:
-                    try:
-                        response = requests.get(m3u_url)
-                        if response.status_code == 200:
-                            lines = response.text.splitlines()
-                            name, logo, url = None, '', ''
-                            for line in lines:
-                                if line.startswith('#EXTINF:'):
-                                    try:
-                                        parts = line.split(',', 1)
-                                        name = parts[1].strip()
-                                        logo_part = line.split('tvg-logo="')
-                                        if len(logo_part) > 1:
-                                            logo = logo_part[1].split('"')[0]
-                                        else:
-                                            logo = ''
-                                    except:
-                                        continue
-                                elif line.startswith('http'):
-                                    url = line.strip()
-                                    if name and url:
-                                        c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
-                                                  (name, url, logo))
-                                        name, logo, url = None, '', ''
-                            conn.commit()
-                    except Exception as e:
-                        flash(f"Failed to load URL: {e}", "danger")
-
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
         token_data = []
@@ -144,7 +113,6 @@ def admin():
             c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (t[0],))
             ip_count = c.fetchone()[0]
             token_data.append((t[0], t[1], ip_count, t[2], t[3]))
-
         c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100')
         logs = c.fetchall()
         c.execute('SELECT * FROM channels')
@@ -177,12 +145,6 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
-# ----- NOT ALLOWED PAGE -----
-@app.route('/not-allowed')
-def not_allowed():
-    return render_template('not_allowed.html'), 403
-
-# ----- PLAYLIST -----
 @app.route('/iptvplaylist.m3u')
 def playlist():
     token = request.args.get('token')
@@ -191,9 +153,11 @@ def playlist():
     ref = request.referrer or ''
     now = datetime.utcnow()
 
-    # Redirect browser-based clients
-    browser_keywords = ['mozilla', 'chrome', 'safari', 'edge', 'firefox']
-    if any(keyword in ua for keyword in browser_keywords):
+    danger_agents = ['httpcanary', 'mitm', 'fiddler', 'packet', 'charles', 'wireshark']
+    if any(tool in ua for tool in danger_agents):
+        return abort(403, 'Sniffer Tool Detected')
+
+    if 'mozilla' in ua and not any(x in ua for x in ['vlc', 'ott', 'perfect', 'iptv']):
         return redirect('/not-allowed')
 
     with sqlite3.connect(DB) as conn:
@@ -233,16 +197,11 @@ def playlist():
         lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
         lines.append(url)
 
-    return (
-        '\n'.join(lines),
-        200,
-        {
-            'Content-Type': 'application/x-mpegURL',
-            'Content-Disposition': f'attachment; filename="{token}.m3u"'
-        }
-    )
+    return ('\n'.join(lines), 200, {
+        'Content-Type': 'application/x-mpegURL',
+        'Content-Disposition': f'inline; filename="{token}.m3u"'
+    })
 
-# ----- UNLOCK PAGE -----
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
@@ -253,6 +212,10 @@ def unlock():
             conn.execute('INSERT INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'user'))
             conn.commit()
     return render_template('unlock.html', token=token)
+
+@app.route('/not-allowed')
+def not_allowed():
+    return render_template('not_allowed.html')
 
 if __name__ == '__main__':
     app.run(debug=False, port=5000)
