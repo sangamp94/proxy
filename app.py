@@ -166,16 +166,10 @@ def playlist():
     ref = request.referrer or ''
     now = datetime.utcnow()
 
+    # Basic sniffer block
     danger_agents = ['httpcanary', 'mitm', 'fiddler', 'packet', 'charles', 'wireshark']
-
-    # Block known sniffers or blank UA
     if not ua or any(tool in ua for tool in danger_agents):
         return abort(403, 'Sniffer Tool Detected')
-
-    # Allow only legit IPTV players
-    allowed_clients = ['vlc', 'ott', 'perfect', 'iptv', 'exoplayer', 'playback']
-    if not any(ac in ua for ac in allowed_clients):
-        return redirect('/not-allowed')
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
