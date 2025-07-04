@@ -39,7 +39,6 @@ def init_db():
 
 init_db()
 
-# Auth Decorator
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -166,10 +165,17 @@ def playlist():
     ref = request.referrer or ''
     now = datetime.utcnow()
 
-    # Basic sniffer block
-    danger_agents = ['httpcanary', 'mitm', 'fiddler', 'packet', 'charles', 'wireshark']
-    if not ua or any(tool in ua for tool in danger_agents):
-        return abort(403, 'Sniffer Tool Detected')
+    # 🔒 Sniffer detection
+    sniffers = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy']
+    if not ua or any(tool in ua for tool in sniffers):
+        print("🚫 Sniffer Detected — Beta, tumse na ho payega 😎")
+        with sqlite3.connect(DB) as conn:
+            if token:
+                conn.execute("UPDATE tokens SET banned = 1 WHERE token = ?", (token,))
+            conn.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
+                         (now.isoformat(), ip, token or 'unknown', ua, ref))
+            conn.commit()
+        return abort(403, 'Beta, tumse na ho payega 😎')
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
