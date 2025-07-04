@@ -1,7 +1,7 @@
 from flask import Flask, request, redirect, render_template, session, url_for, send_file, abort, flash
 from functools import wraps
 from datetime import datetime, timedelta
-import sqlite3, os, uuid
+import sqlite3, os, uuid, requests
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'  # Change in production
@@ -69,6 +69,7 @@ def admin():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
 
+        # Add token manually
         if request.method == 'POST':
             if 'add_token' in request.form:
                 token = request.form['token']
@@ -77,11 +78,13 @@ def admin():
                 c.execute('INSERT OR REPLACE INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'admin'))
                 conn.commit()
 
+            # Add channel manually
             elif 'add_channel' in request.form:
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
                           (request.form['name'], request.form['stream'], request.form['logo']))
                 conn.commit()
 
+            # Upload M3U from file
             elif 'upload_m3u' in request.form and 'm3ufile' in request.files:
                 m3ufile = request.files['m3ufile']
                 if m3ufile.filename.endswith('.m3u'):
@@ -106,6 +109,38 @@ def admin():
                                           (name, url, logo))
                                 name, logo, url = None, '', ''
                     conn.commit()
+
+            # Upload M3U from URL
+            elif 'upload_m3u_url' in request.form:
+                m3u_url = request.form['m3u_url']
+                try:
+                    response = requests.get(m3u_url, timeout=10)
+                    if response.status_code == 200 and '#EXTM3U' in response.text:
+                        lines = response.text.splitlines()
+                        name, logo, url = None, '', ''
+                        for line in lines:
+                            if line.startswith('#EXTINF:'):
+                                try:
+                                    parts = line.split(',', 1)
+                                    name = parts[1].strip()
+                                    logo_part = line.split('tvg-logo="')
+                                    if len(logo_part) > 1:
+                                        logo = logo_part[1].split('"')[0]
+                                    else:
+                                        logo = ''
+                                except:
+                                    continue
+                            elif line.startswith('http'):
+                                url = line.strip()
+                                if name and url:
+                                    c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
+                                              (name, url, logo))
+                                    name, logo, url = None, '', ''
+                        conn.commit()
+                    else:
+                        flash('Invalid M3U URL or content not found', 'error')
+                except Exception as e:
+                    flash(f'Error fetching M3U: {e}', 'error')
 
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
