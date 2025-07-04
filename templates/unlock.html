@@ -1,14 +1,21 @@
 <!DOCTYPE html>
 <html>
-<head><title>Unlock Playlist</title></head>
+<head>
+  <title>Get Token</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
 <body>
-    <h2>Unlock IPTV Access</h2>
+  <div class="container">
+    <h2>🎁 Unlock IPTV Access</h2>
     <form method="POST">
-        <button type="submit">Unlock Now</button>
+      <button type="submit">Get My Token</button>
     </form>
+
     {% if token %}
-        <p>Your Token: <strong>{{ token }}</strong></p>
-        <p>Use: <code>iptvplaylist.m3u?token={{ token }}</code></p>
+      <p><strong>Your Token:</strong> <code>{{ token }}</code></p>
+      <p>Use this URL in your player:</p>
+      <code>/iptvplaylist.m3u?token={{ token }}</code>
     {% endif %}
+  </div>
 </body>
 </html>
