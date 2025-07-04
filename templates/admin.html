@@ -31,6 +31,20 @@
   <div class="container py-4">
     <h2 class="mb-4 text-center">🎛️ IPTV Admin Panel</h2>
 
+    <!-- Flash Messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <div class="alert alert-dismissible fade show" role="alert">
+          {% for category, message in messages %}
+            <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+              {{ message }}
+              <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
     <!-- Add Token -->
     <h4>Add Token</h4>
     <form method="POST" class="row g-2 mb-4">
@@ -71,6 +85,17 @@
       <div class="col-md-3">
         <input type="hidden" name="upload_m3u" value="1">
         <button type="submit" class="btn btn-warning w-100">Upload & Add Channels</button>
+      </div>
+    </form>
+
+    <!-- Upload .m3u from URL -->
+    <h4>Upload .m3u Playlist via URL</h4>
+    <form method="POST" class="row g-2 mb-4">
+      <div class="col-md-9">
+        <input type="text" name="m3u_url" placeholder="Enter M3U Playlist URL" class="form-control" required>
+      </div>
+      <div class="col-md-3">
+        <button type="submit" name="upload_m3u_url" class="btn btn-warning w-100">Fetch & Add Channels</button>
       </div>
     </form>
 
@@ -175,5 +200,7 @@
       <a href="/logout" class="btn btn-outline-light">Logout</a>
     </div>
   </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
