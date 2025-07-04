@@ -1,4 +1,2 @@
-Flask
-Flask-SQLAlchemy
-Werkzeug
-gunicorn
+Flask==3.0.3
+pytz
