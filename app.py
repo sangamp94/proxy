@@ -1,16 +1,13 @@
 # app.py
-from flask import Flask, request, redirect, render_template, session, url_for, send_file, abort
+from flask import Flask, request, redirect, render_template, session, url_for, send_file, abort, flash
 from functools import wraps
 from datetime import datetime, timedelta
-import sqlite3, os
-import logging
+import sqlite3, os, uuid
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'  # Change in production
 DB = 'database.db'
 MAX_DEVICES = 4
-
-logging.basicConfig(level=logging.INFO)
 
 # ----- DB SETUP -----
 def init_db():
@@ -19,7 +16,8 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS tokens (
                         token TEXT PRIMARY KEY,
                         expiry TEXT,
-                        banned INTEGER DEFAULT 0
+                        banned INTEGER DEFAULT 0,
+                        created_by TEXT DEFAULT 'admin'
                     )''')
         c.execute('''CREATE TABLE IF NOT EXISTS token_ips (
                         token TEXT,
@@ -76,7 +74,7 @@ def admin():
                 token = request.form['token']
                 days = int(request.form['days'])
                 expiry = (datetime.utcnow() + timedelta(days=days)).isoformat()
-                c.execute('INSERT OR REPLACE INTO tokens(token, expiry) VALUES (?, ?)', (token, expiry))
+                c.execute('INSERT OR REPLACE INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'admin'))
                 conn.commit()
             elif 'add_channel' in request.form:
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
@@ -89,7 +87,7 @@ def admin():
         for t in tokens:
             c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (t[0],))
             ip_count = c.fetchone()[0]
-            token_data.append((t[0], t[1], ip_count, t[2]))
+            token_data.append((t[0], t[1], ip_count, t[2], t[3]))  # includes created_by
         c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100')
         logs = c.fetchall()
         c.execute('SELECT * FROM channels')
@@ -152,7 +150,9 @@ def playlist():
         exists = c.fetchone()
         if not exists:
             if count >= MAX_DEVICES:
-                return abort(403, 'Device limit exceeded')
+                c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+                conn.commit()
+                return abort(403, 'Device limit exceeded. Token banned.')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
         # Log access
@@ -171,10 +171,17 @@ def playlist():
         lines.append(url)
     return '\n'.join(lines), 200, {'Content-Type': 'application/x-mpegURL'}
 
-@app.route('/unlock', methods=['GET'])
+# ----- UNLOCK PAGE -----
+@app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
-    return render_template('unlock.html')
+    token = None
+    if request.method == 'POST':
+        token = uuid.uuid4().hex[:12]
+        expiry = (datetime.utcnow() + timedelta(days=30)).isoformat()
+        with sqlite3.connect(DB) as conn:
+            conn.execute('INSERT INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'user'))
+            conn.commit()
+    return render_template('unlock.html', token=token)
 
 if __name__ == '__main__':
-    # Avoid debug=True for environments that may not support multiprocessing (e.g. sandboxed or minimal containers)
     app.run(debug=False, port=5000)
