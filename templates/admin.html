@@ -1,0 +1,46 @@
+<!DOCTYPE html><html><head>
+  <title>Admin Panel</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head><body>
+<div class="container">
+  <h1>Admin Panel</h1>
+  <form method="POST"><button name="action" value="add_token">➕ New Token</button></form>
+  <section><h2>All Tokens</h2>
+  <table><tr><th>Token</th><th>Expiry</th><th>IPs</th><th>Banned</th><th>Actions</th></tr>
+  {% for tk,exp,ips,ban in tokens %}
+    <tr>
+      <td>{{ tk }}</td><td>{{ exp[:19] }}</td><td>{{ ips }}</td><td>{{ 'Yes' if ban else 'No' }}</td>
+      <td>
+        <a href="?action=delete&token={{tk}}">Delete</a> |
+        <a href="?action=reset_ip&token={{tk}}">Reset IP</a> |
+        <a href="?action=renew&token={{tk}}">Renew</a> |
+        <a href="?action=ban&token={{tk}}">Ban</a>
+      </td>
+    </tr>
+  {% endfor %}</table>
+  </section>
+
+  <section><h2>Channels</h2>
+    <form action="/add_channel" method="POST">
+      <input name="name" placeholder="Name" required>
+      <input name="stream_url" placeholder="Stream URL" required>
+      <input name="logo_url" placeholder="Logo URL">
+      <button>Add Channel</button>
+    </form>
+    <ul>
+      {% for id,name,url,logo in channels %}
+        <li>{{ name }} - <a href="{{ url }}">Stream</a> | <a href="{{ logo }}">Logo</a> | <a href="/delete_channel/{{ id }}">Delete</a></li>
+      {% endfor %}
+    </ul>
+  </section>
+
+  <section><h2>Access Logs</h2>
+    <table><tr><th>Time</th><th>IP</th><th>Token</th><th>UA</th><th>Referrer</th></tr>
+    {% for t,ip,tk,ua,ref in logs %}
+      <tr><td>{{ t[:19] }}</td><td>{{ ip }}</td><td>{{ tk }}</td><td>{{ ua|truncate(30) }}</td><td>{{ ref|truncate(30) }}</td></tr>
+    {% endfor %}
+    </table>
+  </section>
+
+  <a href="/logout">Logout</a>
+</div></body></html>
