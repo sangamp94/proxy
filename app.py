@@ -1,10 +1,10 @@
-from flask import Flask, request, redirect, render_template, session, url_for, send_file, abort, flash
+from flask import Flask, request, redirect, render_template, session, abort, flash
 from functools import wraps
 from datetime import datetime, timedelta
 import sqlite3, os, uuid, requests
 
 app = Flask(__name__)
-app.secret_key = 'supersecretkey'  # Change in production
+app.secret_key = 'supersecretkey'  # Replace in production
 DB = 'database.db'
 MAX_DEVICES = 4
 
@@ -69,7 +69,6 @@ def admin():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
 
-        # Add token manually
         if request.method == 'POST':
             if 'add_token' in request.form:
                 token = request.form['token']
@@ -78,13 +77,11 @@ def admin():
                 c.execute('INSERT OR REPLACE INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'admin'))
                 conn.commit()
 
-            # Add channel manually
             elif 'add_channel' in request.form:
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
                           (request.form['name'], request.form['stream'], request.form['logo']))
                 conn.commit()
 
-            # Upload M3U from file
             elif 'upload_m3u' in request.form and 'm3ufile' in request.files:
                 m3ufile = request.files['m3ufile']
                 if m3ufile.filename.endswith('.m3u'):
@@ -110,37 +107,35 @@ def admin():
                                 name, logo, url = None, '', ''
                     conn.commit()
 
-            # Upload M3U from URL
             elif 'upload_m3u_url' in request.form:
-                m3u_url = request.form['m3u_url']
-                try:
-                    response = requests.get(m3u_url, timeout=10)
-                    if response.status_code == 200 and '#EXTM3U' in response.text:
-                        lines = response.text.splitlines()
-                        name, logo, url = None, '', ''
-                        for line in lines:
-                            if line.startswith('#EXTINF:'):
-                                try:
-                                    parts = line.split(',', 1)
-                                    name = parts[1].strip()
-                                    logo_part = line.split('tvg-logo="')
-                                    if len(logo_part) > 1:
-                                        logo = logo_part[1].split('"')[0]
-                                    else:
-                                        logo = ''
-                                except:
-                                    continue
-                            elif line.startswith('http'):
-                                url = line.strip()
-                                if name and url:
-                                    c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
-                                              (name, url, logo))
-                                    name, logo, url = None, '', ''
-                        conn.commit()
-                    else:
-                        flash('Invalid M3U URL or content not found', 'error')
-                except Exception as e:
-                    flash(f'Error fetching M3U: {e}', 'error')
+                m3u_url = request.form.get('m3u_url')
+                if m3u_url:
+                    try:
+                        response = requests.get(m3u_url)
+                        if response.status_code == 200:
+                            lines = response.text.splitlines()
+                            name, logo, url = None, '', ''
+                            for line in lines:
+                                if line.startswith('#EXTINF:'):
+                                    try:
+                                        parts = line.split(',', 1)
+                                        name = parts[1].strip()
+                                        logo_part = line.split('tvg-logo="')
+                                        if len(logo_part) > 1:
+                                            logo = logo_part[1].split('"')[0]
+                                        else:
+                                            logo = ''
+                                    except:
+                                        continue
+                                elif line.startswith('http'):
+                                    url = line.strip()
+                                    if name and url:
+                                        c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
+                                                  (name, url, logo))
+                                        name, logo, url = None, '', ''
+                            conn.commit()
+                    except Exception as e:
+                        flash(f"Failed to load URL: {e}", "danger")
 
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
@@ -149,6 +144,7 @@ def admin():
             c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (t[0],))
             ip_count = c.fetchone()[0]
             token_data.append((t[0], t[1], ip_count, t[2], t[3]))
+
         c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100')
         logs = c.fetchall()
         c.execute('SELECT * FROM channels')
@@ -181,14 +177,25 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
+# ----- NOT ALLOWED PAGE -----
+@app.route('/not-allowed')
+def not_allowed():
+    return render_template('not_allowed.html'), 403
+
 # ----- PLAYLIST -----
 @app.route('/iptvplaylist.m3u')
 def playlist():
     token = request.args.get('token')
     ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '')
+    ua = request.headers.get('User-Agent', '').lower()
     ref = request.referrer or ''
     now = datetime.utcnow()
+
+    # Redirect browser-based clients
+    browser_keywords = ['mozilla', 'chrome', 'safari', 'edge', 'firefox']
+    if any(keyword in ua for keyword in browser_keywords):
+        return redirect('/not-allowed')
+
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
         c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,))
@@ -217,7 +224,6 @@ def playlist():
 
         c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
                   (now.isoformat(), ip, token, ua, ref))
-
         c.execute('SELECT name, stream_url, logo_url FROM channels')
         channels = c.fetchall()
         conn.commit()
@@ -226,7 +232,15 @@ def playlist():
     for name, url, logo in channels:
         lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
         lines.append(url)
-    return '\n'.join(lines), 200, {'Content-Type': 'application/x-mpegURL'}
+
+    return (
+        '\n'.join(lines),
+        200,
+        {
+            'Content-Type': 'application/x-mpegURL',
+            'Content-Disposition': f'attachment; filename="{token}.m3u"'
+        }
+    )
 
 # ----- UNLOCK PAGE -----
 @app.route('/unlock', methods=['GET', 'POST'])
