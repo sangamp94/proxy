@@ -1,72 +1,155 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>Admin Panel</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <meta charset="UTF-8">
+  <title>IPTV Admin Panel</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body {
+      background-color: #121212;
+      color: #e0e0e0;
+    }
+    .table-dark th, .table-dark td {
+      vertical-align: middle;
+    }
+    .badge-danger {
+      background-color: #dc3545;
+    }
+    .badge-success {
+      background-color: #198754;
+    }
+    .badge-warning {
+      background-color: #ffc107;
+      color: #000;
+    }
+  </style>
 </head>
 <body>
-  <div class="container">
-    <h2>Admin Panel</h2>
-    <a href="/logout">Logout</a>
+  <div class="container py-4">
+    <h2 class="mb-4 text-center">🎛️ IPTV Admin Panel</h2>
 
-    <h3>Tokens</h3>
-    <form method="post">
-      <input type="text" name="token" placeholder="Token" required>
-      <input type="number" name="days" value="30" min="1">
-      <button name="add_token">Add Token</button>
-    </form>
-    <table>
-      <tr><th>Token</th><th>Expiry</th><th>IPs</th><th>Banned</th><th>Actions</th></tr>
-      {% for t in tokens %}
-      <tr>
-        <td>{{ t[0] }}</td>
-        <td>{{ t[1][:19].replace('T', ' ') }}</td>
-        <td>{{ t[2] }}</td>
-        <td>{{ 'Yes' if t[3] else 'No' }}</td>
-        <td>
-          <a href="/admin/action/{{t[0]}}/delete">Delete</a> |
-          <a href="/admin/action/{{t[0]}}/reset">Reset IPs</a> |
-          <a href="/admin/action/{{t[0]}}/renew">Renew</a> |
-          <a href="/admin/action/{{t[0]}}/ban">Ban</a>
-        </td>
-      </tr>
-      {% endfor %}
-    </table>
-
-    <h3>Add Channel</h3>
-    <form method="post">
-      <input type="text" name="name" placeholder="Channel Name" required>
-      <input type="text" name="stream" placeholder="Stream URL" required>
-      <input type="text" name="logo" placeholder="Logo URL">
-      <button name="add_channel">Add</button>
+    <h4>Add Token</h4>
+    <form method="POST" class="row g-2 mb-4">
+      <div class="col-md-5">
+        <input type="text" name="token" placeholder="Token" class="form-control" required>
+      </div>
+      <div class="col-md-3">
+        <input type="number" name="days" placeholder="Days valid" class="form-control" required>
+      </div>
+      <div class="col-md-2">
+        <button type="submit" name="add_token" class="btn btn-primary w-100">Add Token</button>
+      </div>
     </form>
 
-    <h3>Channels</h3>
-    <table>
-      <tr><th>Name</th><th>Stream URL</th><th>Logo</th><th>Actions</th></tr>
-      {% for c in channels %}
-      <tr>
-        <td>{{ c[1] }}</td>
-        <td>{{ c[2] }}</td>
-        <td><img src="{{ c[3] }}" height="24"></td>
-        <td><a href="/admin/delete_channel/{{c[0]}}">Delete</a></td>
-      </tr>
-      {% endfor %}
-    </table>
+    <h4>Add Channel</h4>
+    <form method="POST" class="row g-2 mb-4">
+      <div class="col-md-3">
+        <input type="text" name="name" placeholder="Channel Name" class="form-control" required>
+      </div>
+      <div class="col-md-5">
+        <input type="text" name="stream" placeholder="Stream URL" class="form-control" required>
+      </div>
+      <div class="col-md-3">
+        <input type="text" name="logo" placeholder="Logo URL" class="form-control">
+      </div>
+      <div class="col-md-1">
+        <button type="submit" name="add_channel" class="btn btn-success w-100">Add</button>
+      </div>
+    </form>
 
-    <h3>Logs</h3>
-    <table>
-      <tr><th>Time</th><th>IP</th><th>Token</th><th>UA</th><th>Referrer</th></tr>
-      {% for log in logs %}
-      <tr>
-        <td>{{ log[0][:19].replace('T', ' ') }}</td>
-        <td>{{ log[1] }}</td>
-        <td>{{ log[2] }}</td>
-        <td>{{ log[3][:30] }}...</td>
-        <td>{{ log[4] }}</td>
-      </tr>
-      {% endfor %}
-    </table>
+    <h4>Tokens</h4>
+    <div class="table-responsive">
+      <table class="table table-dark table-striped table-hover">
+        <thead>
+          <tr>
+            <th>Token</th>
+            <th>Expiry</th>
+            <th>IPs</th>
+            <th>Status</th>
+            <th>Created By</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for token, expiry, ip_count, banned, created_by in tokens %}
+          <tr>
+            <td>{{ token }}</td>
+            <td>{{ expiry }}</td>
+            <td>
+              <span class="badge {% if ip_count >= 4 %}badge-danger{% else %}badge-success{% endif %}">{{ ip_count }}</span>
+            </td>
+            <td>
+              {% if banned %}<span class="badge badge-danger">Banned</span>
+              {% else %}<span class="badge badge-success">Active</span>{% endif %}
+            </td>
+            <td>{{ created_by }}</td>
+            <td>
+              <a href="/admin/action/{{ token }}/delete" class="btn btn-sm btn-danger">Delete</a>
+              <a href="/admin/action/{{ token }}/reset" class="btn btn-sm btn-warning">Reset IPs</a>
+              <a href="/admin/action/{{ token }}/renew" class="btn btn-sm btn-info">Renew</a>
+              <a href="/admin/action/{{ token }}/ban" class="btn btn-sm btn-secondary">Ban</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <h4>Channels</h4>
+    <div class="table-responsive mb-4">
+      <table class="table table-dark table-striped">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Stream</th>
+            <th>Logo</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for id, name, stream_url, logo_url in channels %}
+          <tr>
+            <td>{{ name }}</td>
+            <td><small>{{ stream_url }}</small></td>
+            <td><img src="{{ logo_url }}" alt="logo" width="50"></td>
+            <td>
+              <a href="/admin/delete_channel/{{ id }}" class="btn btn-sm btn-danger">Delete</a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <h4>Logs (latest 100)</h4>
+    <div class="table-responsive">
+      <table class="table table-dark table-sm">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>IP</th>
+            <th>Token</th>
+            <th>User-Agent</th>
+            <th>Referrer</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t, ip, token, ua, ref in logs %}
+          <tr>
+            <td>{{ t }}</td>
+            <td>{{ ip }}</td>
+            <td>{{ token }}</td>
+            <td><small>{{ ua }}</small></td>
+            <td><small>{{ ref }}</small></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="text-center mt-4">
+      <a href="/logout" class="btn btn-outline-light">Logout</a>
+    </div>
   </div>
 </body>
 </html>
