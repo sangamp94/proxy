@@ -1,0 +1,10 @@
+body { background: #121212; color: #eee; font-family: sans-serif; margin:0; padding:20px; }
+.container { max-width:1000px; margin:auto; }
+h1,h2 { color:#ffcc00; }
+table { width:100%; border-collapse: collapse; margin-bottom:20px;}
+th,td { border:1px solid #333; padding:8px;}
+th { background:#333; }
+a { color:#66ccff; text-decoration:none; }
+button { background:#333; color:#fff; padding:6px 12px; border:none; cursor:pointer; }
+button:hover, a:hover { opacity:0.8; }
+input { padding:6px; margin:4px;}
