@@ -14,28 +14,28 @@ def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS tokens (
-                        token TEXT PRIMARY KEY,
-                        expiry TEXT,
-                        banned INTEGER DEFAULT 0,
-                        created_by TEXT DEFAULT 'admin')''')
+                            token TEXT PRIMARY KEY,
+                            expiry TEXT,
+                            banned INTEGER DEFAULT 0,
+                            created_by TEXT DEFAULT 'admin')''')
         c.execute('''CREATE TABLE IF NOT EXISTS token_ips (
-                        token TEXT,
-                        ip TEXT,
-                        UNIQUE(token, ip))''')
+                            token TEXT,
+                            ip TEXT,
+                            UNIQUE(token, ip))''')
         c.execute('''CREATE TABLE IF NOT EXISTS logs (
-                        timestamp TEXT,
-                        ip TEXT,
-                        token TEXT,
-                        user_agent TEXT,
-                        referrer TEXT)''')
+                            timestamp TEXT,
+                            ip TEXT,
+                            token TEXT,
+                            user_agent TEXT,
+                            referrer TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS channels (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT,
-                        stream_url TEXT,
-                        logo_url TEXT)''')
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name TEXT,
+                            stream_url TEXT,
+                            logo_url TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (
-                        ip TEXT PRIMARY KEY,
-                        unblock_time REAL)''')
+                            ip TEXT PRIMARY KEY,
+                            unblock_time REAL)''')
 init_db()
 
 # ------------------------ AUTH DECORATOR ------------------------ #
@@ -185,7 +185,7 @@ def playlist():
             unblock_at = time.time() + BLOCK_DURATION
             c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_at))
             c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
-                     (now.isoformat(), ip, token or 'unknown', ua, ref))
+                      (now.isoformat(), ip, token or 'unknown', ua, ref))
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
 
