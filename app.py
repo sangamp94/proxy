@@ -8,7 +8,6 @@ app.secret_key = 'supersecretkey'
 DB = 'database.db'
 MAX_DEVICES = 4
 
-# DB Initialization
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -166,9 +165,12 @@ def playlist():
     now = datetime.utcnow()
 
     # 🔒 Sniffer detection
-    sniffers = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy']
+    sniffers = [
+        'httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark',
+        'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman'
+    ]
     if not ua or any(tool in ua for tool in sniffers):
-        print("🚫 Sniffer Detected — Beta, tumse na ho payega 😎")
+        print(f"❌ Sniffer detected from {ip} with UA: {ua} — Beta, tumse na ho payega 😎")
         with sqlite3.connect(DB) as conn:
             if token:
                 conn.execute("UPDATE tokens SET banned = 1 WHERE token = ?", (token,))
