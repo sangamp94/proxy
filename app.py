@@ -1,3 +1,8 @@
+Okay, if your goal is to **block all sniffers, regardless of whether Tivimate is running alongside**, then the modification I provided previously is indeed the correct one for that specific objective.
+
+Here's the full code again with that change, and I'll explicitly highlight the relevant line:
+
+```python
 from flask import Flask, request, redirect, render_template, session, abort
 from functools import wraps
 from datetime import datetime, timedelta
@@ -181,7 +186,10 @@ def playlist():
         if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
 
-        # MODIFIED LINE: Removed the 'and 'tivimate' not in ua' condition
+        # THIS IS THE KEY MODIFICATION for blocking all sniffers
+        # If any sniffer string is found in the User-Agent, it will be blocked.
+        # This means if Tivimate's UA is combined with a sniffer's UA (e.g., "TiviMate... HttpCanary"),
+        # it will be caught by this condition.
         if any(tool in ua for tool in sniffers):
             unblock_at = time.time() + BLOCK_DURATION
             c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_at))
@@ -249,3 +257,4 @@ def not_allowed():
 
 if __name__ == '__main__':
     app.run(debug=False, port=5000)
+```
