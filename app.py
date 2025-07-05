@@ -181,7 +181,7 @@ def playlist():
         if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
 
-        if any(tool in ua for tool in sniffers):
+        if any(tool in ua for tool in sniffers) and 'tivimate' not in ua:
             unblock_at = time.time() + BLOCK_DURATION
             c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_at))
             c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
@@ -200,8 +200,8 @@ def playlist():
         except ValueError:
             return abort(500, 'Invalid expiry format')
 
-        if banned or expiry_time < now:
-            return abort(403, 'Token Expired or Banned')
+        if banned:
+            return abort(403, 'Token Banned')
 
         c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,))
         count = c.fetchone()[0]
