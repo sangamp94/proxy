@@ -178,12 +178,14 @@ def playlist():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
 
+        # Block if previously flagged IP
         c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,))
         row = c.fetchone()
         if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
 
-        if any(tool in ua for tool in sniffers):
+        # Block known sniffers or bad user agents
+        if any(tool in ua for tool in sniffers) or 'test' not in ua:
             unblock_at = time.time() + BLOCK_DURATION
             c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_at))
             c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
@@ -191,6 +193,7 @@ def playlist():
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
 
+        # Validate token
         c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,))
         result = c.fetchone()
         if not result:
@@ -205,6 +208,7 @@ def playlist():
         if banned:
             return abort(403, 'Token Banned')
 
+        # IP/device limit check
         c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,))
         count = c.fetchone()[0]
         c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip))
@@ -216,8 +220,11 @@ def playlist():
                 return abort(403, 'Device limit exceeded. Token banned.')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
+        # Log the request
         c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
                   (now.isoformat(), ip, token, ua, ref))
+
+        # Fetch playlist
         c.execute('SELECT name, stream_url, logo_url FROM channels')
         channels = c.fetchall()
         conn.commit()
@@ -231,6 +238,7 @@ def playlist():
         'Content-Type': 'application/x-mpegURL',
         'Content-Disposition': f'inline; filename="{token}.m3u"'
     })
+
 
 # ------------------------ UNLOCK ------------------------ #
 @app.route('/unlock', methods=['GET', 'POST'])
