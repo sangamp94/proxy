@@ -1,7 +1,7 @@
 from flask import Flask, request, redirect, render_template, session, abort, Response
 from functools import wraps
 from datetime import datetime, timedelta
-import sqlite3, os, uuid, requests, time, urllib.parse
+import sqlite3, os, uuid, requests, time
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
@@ -80,9 +80,8 @@ def admin():
 
             elif 'add_channel' in request.form:
                 stream = request.form['stream']
-                proxy_url = stream
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
-                          (request.form['name'], proxy_url, request.form['logo']))
+                          (request.form['name'], stream, request.form['logo']))
                 conn.commit()
 
             elif 'upload_m3u' in request.form and 'm3ufile' in request.files:
@@ -173,6 +172,8 @@ def playlist():
     ref = request.referrer or ''
     now = datetime.utcnow()
 
+    print(f"[DEBUG] IP: {ip}, UA: {ua}, Token: {token}")
+
     sniffers = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman']
 
     with sqlite3.connect(DB) as conn:
@@ -184,7 +185,7 @@ def playlist():
         if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
 
-        # Block known sniffers or bad user agents
+        # Block sniffers or non-'test' UAs
         if any(tool in ua for tool in sniffers) or 'test' not in ua:
             unblock_at = time.time() + BLOCK_DURATION
             c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_at))
@@ -239,8 +240,7 @@ def playlist():
         'Content-Disposition': f'inline; filename="{token}.m3u"'
     })
 
-
-# ------------------------ UNLOCK ------------------------ #
+# ------------------------ UNLOCK PAGE ------------------------ #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
@@ -256,5 +256,6 @@ def unlock():
 def not_allowed():
     return render_template('not_allowed.html')
 
+# ------------------------ MAIN ------------------------ #
 if __name__ == '__main__':
     app.run(debug=False, port=5000)
