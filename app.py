@@ -161,7 +161,7 @@ def playlist():
 
     print(f"[DEBUG] IP: {ip}, UA: {ua}, Token: {token}")
 
-    sniffers = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman']
+    sniffers = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
     allowed_agents = ['test', 'ottnavigator']
 
     # normalize UA
