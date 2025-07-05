@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, render_template, session, abort
+from flask import Flask, request, redirect, render_template, session, abort, Response
 from functools import wraps
 from datetime import datetime, timedelta
 import sqlite3, os, uuid, requests, time
@@ -9,36 +9,36 @@ DB = 'database.db'
 MAX_DEVICES = 4
 BLOCK_DURATION = 300  # 5 minutes
 
-# ------------------------ INIT DB ------------------------ #
+# ------------------------ DB INIT ------------------------ #
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS tokens (
-            token TEXT PRIMARY KEY,
-            expiry TEXT,
-            banned INTEGER DEFAULT 0,
-            created_by TEXT DEFAULT 'admin')''')
+                            token TEXT PRIMARY KEY,
+                            expiry TEXT,
+                            banned INTEGER DEFAULT 0,
+                            created_by TEXT DEFAULT 'admin')''')
         c.execute('''CREATE TABLE IF NOT EXISTS token_ips (
-            token TEXT,
-            ip TEXT,
-            UNIQUE(token, ip))''')
+                            token TEXT,
+                            ip TEXT,
+                            UNIQUE(token, ip))''')
         c.execute('''CREATE TABLE IF NOT EXISTS logs (
-            timestamp TEXT,
-            ip TEXT,
-            token TEXT,
-            user_agent TEXT,
-            referrer TEXT)''')
+                            timestamp TEXT,
+                            ip TEXT,
+                            token TEXT,
+                            user_agent TEXT,
+                            referrer TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            stream_url TEXT,
-            logo_url TEXT)''')
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name TEXT,
+                            stream_url TEXT,
+                            logo_url TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (
-            ip TEXT PRIMARY KEY,
-            unblock_time REAL)''')
+                            ip TEXT PRIMARY KEY,
+                            unblock_time REAL)''')
 init_db()
 
-# ------------------------ AUTH ------------------------ #
+# ------------------------ AUTH DECORATOR ------------------------ #
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -79,11 +79,9 @@ def admin():
                 conn.commit()
 
             elif 'add_channel' in request.form:
-                name = request.form['name']
-                logo = request.form['logo']
                 stream = request.form['stream']
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
-                          (name, stream, logo))
+                          (request.form['name'], stream, request.form['logo']))
                 conn.commit()
 
             elif 'upload_m3u' in request.form and 'm3ufile' in request.files:
@@ -111,7 +109,6 @@ def admin():
             c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (t[0],))
             ip_count = c.fetchone()[0]
             token_data.append((t[0], t[1], ip_count, t[2], t[3]))
-
         c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100')
         logs = c.fetchall()
         c.execute('SELECT * FROM channels')
@@ -171,22 +168,25 @@ def delete_channel(id):
 def playlist():
     token = request.args.get('token')
     ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').strip().lower()
+    ua = request.headers.get('User-Agent', '').lower()
     ref = request.referrer or ''
     now = datetime.utcnow()
 
-    print(f"[DEBUG] UA: '{ua}' from IP: {ip}")
+    print(f"[DEBUG] IP: {ip}, UA: {ua}, Token: {token}")
+
+    sniffers = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman']
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
 
+        # Block if previously flagged IP
         c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,))
         row = c.fetchone()
         if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
 
-        # Only allow UA that contains 'test'
-        if 'test' not in ua:
+        # Block sniffers or non-'test' UAs
+        if any(tool in ua for tool in sniffers) or 'test' not in ua:
             unblock_at = time.time() + BLOCK_DURATION
             c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_at))
             c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
@@ -194,21 +194,22 @@ def playlist():
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
 
+        # Validate token
         c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,))
         result = c.fetchone()
         if not result:
             return abort(403, 'Invalid Token')
-
         expiry, banned = result
-        if banned:
-            return abort(403, 'Token Banned')
 
         try:
             expiry_time = datetime.fromisoformat(expiry)
         except ValueError:
             return abort(500, 'Invalid expiry format')
 
-        # Limit to MAX_DEVICES
+        if banned:
+            return abort(403, 'Token Banned')
+
+        # IP/device limit check
         c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,))
         count = c.fetchone()[0]
         c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip))
@@ -220,8 +221,11 @@ def playlist():
                 return abort(403, 'Device limit exceeded. Token banned.')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
+        # Log the request
         c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
                   (now.isoformat(), ip, token, ua, ref))
+
+        # Fetch playlist
         c.execute('SELECT name, stream_url, logo_url FROM channels')
         channels = c.fetchall()
         conn.commit()
@@ -236,7 +240,7 @@ def playlist():
         'Content-Disposition': f'inline; filename="{token}.m3u"'
     })
 
-# ------------------------ UNLOCK ------------------------ #
+# ------------------------ UNLOCK PAGE ------------------------ #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
@@ -252,5 +256,6 @@ def unlock():
 def not_allowed():
     return render_template('not_allowed.html')
 
+# ------------------------ MAIN ------------------------ #
 if __name__ == '__main__':
     app.run(debug=False, port=5000)
