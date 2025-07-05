@@ -9,6 +9,9 @@ DB = 'database.db'
 MAX_DEVICES = 4
 BLOCK_DURATION = 300  # seconds
 
+SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
+ALLOWED_AGENTS = ['ottnavigator', 'test']
+
 # ------------------------ DB INIT ------------------------ #
 def init_db():
     with sqlite3.connect(DB) as conn:
@@ -38,7 +41,7 @@ def init_db():
             unblock_time REAL)''')
 init_db()
 
-# ------------------------ AUTH ------------------------ #
+# ------------------------ LOGIN SYSTEM ------------------------ #
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -61,7 +64,7 @@ def logout():
     session.pop('admin', None)
     return redirect('/login')
 
-# ------------------------ ADMIN ------------------------ #
+# ------------------------ ADMIN PANEL ------------------------ #
 @app.route('/admin', methods=['GET', 'POST'])
 @login_required
 def admin():
@@ -69,25 +72,22 @@ def admin():
         c = conn.cursor()
         if request.method == 'POST':
             if 'add_token' in request.form:
-                token = request.form['token']
+                token = request.form['token'].strip()
                 days = int(request.form['days'])
                 expiry = (datetime.utcnow() + timedelta(days=days)).isoformat()
                 c.execute('INSERT OR REPLACE INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)',
                           (token, expiry, 'admin'))
-                conn.commit()
             elif 'add_channel' in request.form:
                 name = request.form['name']
                 stream = request.form['stream']
                 logo = request.form['logo']
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
                           (name, stream, logo))
-                conn.commit()
             elif 'upload_m3u' in request.form and 'm3ufile' in request.files:
                 m3ufile = request.files['m3ufile']
                 if m3ufile.filename.endswith('.m3u'):
                     lines = m3ufile.read().decode('utf-8').splitlines()
                     parse_m3u_lines(lines, c)
-                    conn.commit()
             elif 'm3u_url' in request.form:
                 m3u_url = request.form['m3u_url'].strip()
                 try:
@@ -96,16 +96,13 @@ def admin():
                     if res.status_code == 200:
                         lines = res.text.splitlines()
                         parse_m3u_lines(lines, c)
-                        conn.commit()
                 except Exception as e:
-                    print(f"[ERROR] {e}")
+                    print(f"[ERROR] M3U fetch failed: {e}")
+            conn.commit()
+
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
-        token_data = []
-        for t in tokens:
-            c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (t[0],))
-            ip_count = c.fetchone()[0]
-            token_data.append((t[0], t[1], ip_count, t[2], t[3]))
+        token_data = [(t[0], t[1], c.execute('SELECT COUNT(*) FROM token_ips WHERE token=?', (t[0],)).fetchone()[0], t[2], t[3]) for t in tokens]
         c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100')
         logs = c.fetchall()
         c.execute('SELECT * FROM channels')
@@ -122,7 +119,7 @@ def delete_channel(id):
 
 # ------------------------ M3U PARSER ------------------------ #
 def parse_m3u_lines(lines, c):
-    name, logo, url = None, '', ''
+    name, logo = None, ''
     for line in lines:
         if line.startswith('#EXTINF:'):
             try:
@@ -136,7 +133,19 @@ def parse_m3u_lines(lines, c):
             url = line.strip()
             if name and url:
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
-                name, logo, url = None, '', ''
+                name, logo = None, ''
+
+# ------------------------ HELPER ------------------------ #
+def is_sniffer(ip, ua, ua_param):
+    if any(s in ua for s in SNIFFERS) or ua_param != 'ott' or not any(agent in ua for agent in ALLOWED_AGENTS):
+        return True
+    return False
+
+def log_block(c, ip, token, ua, ref):
+    unblock_time = time.time() + BLOCK_DURATION
+    c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
+    c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
+              (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
 
 # ------------------------ IPTV PLAYLIST ------------------------ #
 @app.route('/iptvplaylist.m3u')
@@ -146,43 +155,33 @@ def playlist():
     ip = request.remote_addr
     ua = request.headers.get('User-Agent', '').strip().lower()
     ref = request.referrer or ''
-    now = datetime.utcnow()
-
-    sniffers = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
-    allowed_agents = ['ottnavigator', 'test']
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,))
-        row = c.fetchone()
-        if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
-        if any(s in ua for s in sniffers) or ua_param != 'ott' or not any(agent in ua for agent in allowed_agents):
-            unblock_time = time.time() + BLOCK_DURATION
-            c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
-            c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
-                      (now.isoformat(), ip, token or 'unknown', ua, ref))
+        if c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone():
+            if time.time() < c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()[0]:
+                return render_template('sniffer_blocked.html'), 403
+        if is_sniffer(ip, ua, ua_param):
+            log_block(c, ip, token, ua, ref)
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
+
         c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,))
-        result = c.fetchone()
-        if not result:
-            return abort(403, 'Invalid Token')
-        expiry, banned = result
-        if banned:
-            return abort(403, 'Token Banned')
+        row = c.fetchone()
+        if not row or row[1]:
+            return abort(403, 'Invalid or banned token')
+
         c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,))
         count = c.fetchone()[0]
-        c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip))
-        exists = c.fetchone()
-        if not exists:
+        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
             if count >= MAX_DEVICES:
                 c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
                 conn.commit()
-                return abort(403, 'Device limit exceeded. Token banned.')
+                return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+
         c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
-                  (now.isoformat(), ip, token, ua, ref))
+                  (datetime.utcnow().isoformat(), ip, token, ua, ref))
         c.execute('SELECT name, stream_url, logo_url FROM channels')
         channels = c.fetchall()
         conn.commit()
@@ -190,9 +189,9 @@ def playlist():
     lines = ['#EXTM3U']
     for name, url, logo in channels:
         uid = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
-        proxy_url = f'https://{request.host}/stream?token={token}&channelid={uid}|User-Agent=ott'
+        stream_url = f'https://{request.host}/stream?token={token}&channelid={uid}|User-Agent=ott'
         lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
-        lines.append(proxy_url)
+        lines.append(stream_url)
 
     return Response('\n'.join(lines), mimetype='application/x-mpegURL')
 
@@ -200,56 +199,45 @@ def playlist():
 @app.route('/stream')
 def stream():
     token = request.args.get('token', '').strip()
-    full_channelid = request.args.get('channelid', '')
+    full_id = request.args.get('channelid', '')
     try:
-        channelid, ua_param = full_channelid.split('|User-Agent=')
+        channelid, ua_param = full_id.split('|User-Agent=')
         ua_param = ua_param.lower()
     except:
-        return abort(400, 'Invalid format')
+        return abort(400, 'Invalid channelid format')
+
     ip = request.remote_addr
     ua = request.headers.get('User-Agent', '').lower()
-    now = datetime.utcnow()
-
-    sniffers = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
-    allowed_agents = ['ottnavigator', 'test']
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,))
-        row = c.fetchone()
-        if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
-        if any(s in ua for s in sniffers) or ua_param != 'ott' or not any(agent in ua for agent in allowed_agents):
-            unblock_time = time.time() + BLOCK_DURATION
-            c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
-            c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
-                      (now.isoformat(), ip, token or 'unknown', ua, request.referrer or ''))
+        if c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone():
+            if time.time() < c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()[0]:
+                return render_template('sniffer_blocked.html'), 403
+        if is_sniffer(ip, ua, ua_param):
+            log_block(c, ip, token, ua, request.referrer or '')
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
+
         c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,))
-        result = c.fetchone()
-        if not result:
-            return abort(403, 'Invalid Token')
-        expiry, banned = result
-        if banned:
-            return abort(403, 'Token Banned')
-        c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,))
-        count = c.fetchone()[0]
-        c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip))
-        exists = c.fetchone()
-        if not exists:
-            if count >= MAX_DEVICES:
+        row = c.fetchone()
+        if not row or row[1]:
+            return abort(403, 'Invalid or banned token')
+
+        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
+            if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
                 c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
                 conn.commit()
-                return abort(403, 'Device limit exceeded. Token banned.')
+                return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
-        c.execute('SELECT name, stream_url, logo_url FROM channels')
-        for name, url, logo in c.fetchall():
+
+        c.execute('SELECT name, stream_url FROM channels')
+        for name, url in c.fetchall():
             if str(uuid.uuid5(uuid.NAMESPACE_URL, url)) == channelid:
                 return redirect(url)
         return abort(404, 'Stream not found')
 
-# ------------------------ USER UNLOCK ------------------------ #
+# ------------------------ PUBLIC TOKEN UNLOCK ------------------------ #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
@@ -257,8 +245,7 @@ def unlock():
         token = uuid.uuid4().hex[:12]
         expiry = (datetime.utcnow() + timedelta(days=30)).isoformat()
         with sqlite3.connect(DB) as conn:
-            conn.execute('INSERT INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)',
-                         (token, expiry, 'user'))
+            conn.execute('INSERT INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'user'))
             conn.commit()
     return render_template('unlock.html', token=token)
 
