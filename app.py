@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, render_template, session, abort, Response
+from flask import Flask, request, redirect, render_template, session, abort, Response, stream_with_context
 from functools import wraps
 from datetime import datetime, timedelta
 import sqlite3, os, uuid, requests, time
@@ -184,7 +184,7 @@ def playlist():
 
     return Response('\n'.join(lines), mimetype='application/x-mpegURL')
 
-# ------------------------ STREAM WRAPPER ------------------------ #
+# ------------------------ STREAM PROXY (Secure) ------------------------ #
 @app.route('/stream')
 def stream():
     token = request.args.get('token', '').strip()
@@ -213,10 +213,15 @@ def stream():
                 return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
-        c.execute('SELECT name, stream_url FROM channels')
-        for name, url in c.fetchall():
+        c.execute('SELECT stream_url FROM channels')
+        for (url,) in c.fetchall():
             if str(uuid.uuid5(uuid.NAMESPACE_URL, url)) == channelid:
-                return redirect(url)
+                try:
+                    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=10)
+                    return Response(stream_with_context(r.iter_content(chunk_size=1024)),
+                                    content_type=r.headers.get('Content-Type', 'application/vnd.apple.mpegurl'))
+                except Exception as e:
+                    return abort(500, f"Proxy error: {e}")
         return abort(404, 'Stream not found')
 
 # ------------------------ TOKEN UNLOCK ------------------------ #
