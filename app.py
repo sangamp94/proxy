@@ -1,8 +1,3 @@
-Okay, if your goal is to **block all sniffers, regardless of whether Tivimate is running alongside**, then the modification I provided previously is indeed the correct one for that specific objective.
-
-Here's the full code again with that change, and I'll explicitly highlight the relevant line:
-
-```python
 from flask import Flask, request, redirect, render_template, session, abort
 from functools import wraps
 from datetime import datetime, timedelta
