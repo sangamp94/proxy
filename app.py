@@ -38,7 +38,7 @@ def init_db():
             unblock_time REAL)''')
 init_db()
 
-# ------------------------ LOGIN AUTH ------------------------ #
+# ------------------------ AUTH ------------------------ #
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -61,7 +61,7 @@ def logout():
     session.pop('admin', None)
     return redirect('/login')
 
-# ------------------------ ADMIN PANEL ------------------------ #
+# ------------------------ ADMIN ------------------------ #
 @app.route('/admin', methods=['GET', 'POST'])
 @login_required
 def admin():
@@ -162,7 +162,10 @@ def playlist():
     print(f"[DEBUG] IP: {ip}, UA: {ua}, Token: {token}")
 
     sniffers = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman']
-    allowed_agents = ['test', 'ott navigator']
+    allowed_agents = ['test', 'ottnavigator']
+
+    # normalize UA
+    ua_clean = ua.replace(' ', '').replace('/', '')
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -173,8 +176,8 @@ def playlist():
         if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
 
-        # Detect sniffer or disallowed UA
-        if any(tool in ua for tool in sniffers) or not any(agent in ua for agent in allowed_agents):
+        # Detect sniffer or bad UA
+        if any(s in ua_clean for s in sniffers) or not any(a in ua_clean for a in allowed_agents):
             unblock_at = time.time() + BLOCK_DURATION
             c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_at))
             c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
@@ -222,7 +225,7 @@ def playlist():
         'Content-Disposition': f'inline; filename="{token}.m3u"'
     })
 
-# ------------------------ TOKEN GENERATOR ------------------------ #
+# ------------------------ USER UNLOCK ------------------------ #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
