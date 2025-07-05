@@ -164,20 +164,22 @@ def playlist():
     ref = request.referrer or ''
     now = datetime.utcnow()
 
-    # 🔒 Sniffer detection
+    # Sniffer detection
     sniffers = [
         'httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark',
         'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman'
     ]
-    if not ua or any(tool in ua for tool in sniffers):
-        print(f"❌ Sniffer detected from {ip} with UA: {ua} — Beta, tumse na ho payega 😎")
+    custom_header = request.headers.get('X-Client-Auth')
+
+    if not ua or any(tool in ua for tool in sniffers) or custom_header != 'tivimate':
+        print(f"❌ Sniffer or fake request from {ip} — UA: {ua}")
         with sqlite3.connect(DB) as conn:
             if token:
                 conn.execute("UPDATE tokens SET banned = 1 WHERE token = ?", (token,))
             conn.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
                          (now.isoformat(), ip, token or 'unknown', ua, ref))
             conn.commit()
-        return abort(403, 'Beta, tumse na ho payega 😎')
+        return render_template('sniffer_blocked.html'), 403
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
