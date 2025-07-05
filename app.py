@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, render_template, session, abort, Response
+from flask import Flask, request, redirect, render_template, session, abort
 from functools import wraps
 from datetime import datetime, timedelta
 import sqlite3, os, uuid, requests, time
@@ -76,6 +76,7 @@ def admin():
                 c.execute('INSERT OR REPLACE INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)',
                           (token, expiry, 'admin'))
                 conn.commit()
+
             elif 'add_channel' in request.form:
                 name = request.form['name']
                 stream = request.form['stream']
@@ -83,6 +84,31 @@ def admin():
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)',
                           (name, stream, logo))
                 conn.commit()
+
+            elif 'upload_m3u' in request.form and 'm3ufile' in request.files:
+                m3ufile = request.files['m3ufile']
+                if m3ufile.filename.endswith('.m3u'):
+                    lines = m3ufile.read().decode('utf-8').splitlines()
+                    parse_m3u_lines(lines, c)
+                    conn.commit()
+
+            elif 'm3u_url' in request.form:
+                m3u_url = request.form['m3u_url'].strip()
+                try:
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    res = requests.get(m3u_url, headers=headers, timeout=10, verify=False)
+                    if res.status_code == 200:
+                        lines = res.text.splitlines()
+                        if lines:
+                            print(f"[DEBUG] M3U URL loaded, {len(lines)} lines")
+                            parse_m3u_lines(lines, c)
+                            conn.commit()
+                        else:
+                            print("[ERROR] M3U file is empty")
+                    else:
+                        print(f"[ERROR] Failed to fetch M3U URL: {res.status_code}")
+                except Exception as e:
+                    print(f"[ERROR] Exception loading M3U URL: {e}")
 
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
@@ -106,6 +132,24 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
+# ------------------------ M3U PARSER ------------------------ #
+def parse_m3u_lines(lines, c):
+    name, logo, url = None, '', ''
+    for line in lines:
+        if line.startswith('#EXTINF:'):
+            try:
+                parts = line.split(',', 1)
+                name = parts[1].strip()
+                logo_part = line.split('tvg-logo="')
+                logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
+            except:
+                continue
+        elif line.startswith('http'):
+            url = line.strip()
+            if name and url:
+                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
+                name, logo, url = None, '', ''
+
 # ------------------------ IPTV PLAYLIST ------------------------ #
 @app.route('/iptvplaylist.m3u')
 def playlist():
@@ -123,13 +167,13 @@ def playlist():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
 
-        # Check if IP is already blocked
+        # Block IP if previously flagged
         c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,))
         row = c.fetchone()
         if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
 
-        # Block sniffers or disallowed User-Agent
+        # Detect sniffer or disallowed UA
         if any(tool in ua for tool in sniffers) or not any(agent in ua for agent in allowed_agents):
             unblock_at = time.time() + BLOCK_DURATION
             c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_at))
@@ -168,7 +212,6 @@ def playlist():
         channels = c.fetchall()
         conn.commit()
 
-    # Build M3U playlist
     lines = ['#EXTM3U']
     for name, url, logo in channels:
         lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
@@ -179,7 +222,7 @@ def playlist():
         'Content-Disposition': f'inline; filename="{token}.m3u"'
     })
 
-# ------------------------ AUTO TOKEN UNLOCK ------------------------ #
+# ------------------------ TOKEN GENERATOR ------------------------ #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
@@ -197,4 +240,4 @@ def not_allowed():
     return render_template('not_allowed.html')
 
 if __name__ == '__main__':
-    app.run(debug=False, port=5000)
+    app.run(debug=True, port=5000)
