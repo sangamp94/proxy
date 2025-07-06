@@ -12,7 +12,7 @@ BLOCK_DURATION = 300 # seconds (5 minutes)
 # User-Agents or keywords commonly associated with sniffers/rippers
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
 # User-Agents commonly associated with allowed IPTV players
-ALLOWED_AGENTS = ['ottnavigator', 'test', 'vlc', 'tivimate'] # 'test' included based on your logs, but consider if it's a real player
+ALLOWED_AGENTS = ['ottnavigator', 'test', 'vlc', 'Tivimate'] # 'test' included based on your logs, but consider if it's a real player
 
 def init_db():
     """Initializes the SQLite database tables if they don't exist."""
