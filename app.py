@@ -1,6 +1,7 @@
 from flask import Flask, request, redirect, render_template, session, abort, Response, stream_with_context
 from functools import wraps
 from datetime import datetime, timedelta
+from urllib.parse import unquote
 import sqlite3, os, uuid, requests, time
 
 app = Flask(__name__)
@@ -23,7 +24,7 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (ip TEXT PRIMARY KEY, unblock_time REAL)''')
 init_db()
 
-# ---------------- LOGIN ---------------- #
+# ---------------- LOGIN SYSTEM ---------------- #
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -101,7 +102,7 @@ def parse_m3u_lines(lines, c):
             c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, line.strip(), logo))
             name, logo = None, ''
 
-# ---------------- SNIFFER PROTECTION ---------------- #
+# ---------------- SNIFFER CHECK ---------------- #
 def is_sniffer(ip, ua):
     return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
 
@@ -122,7 +123,8 @@ def playlist():
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        if c.execute("SELECT unblock_time FROM blocked_ips WHERE ip=?", (ip,)).fetchone() and time.time() < c.execute("SELECT unblock_time FROM blocked_ips WHERE ip=?", (ip,)).fetchone()[0]:
+        row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip=?", (ip,)).fetchone()
+        if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, ref)
@@ -153,7 +155,7 @@ def playlist():
 
     return Response('\n'.join(lines), mimetype='application/x-mpegURL')
 
-# ---------------- STREAM PROXY (with .m3u8 fix) ---------------- #
+# ---------------- STREAM ROUTE (Proxy + Rewrite) ---------------- #
 @app.route('/stream/<uuid:channel_id>')
 def stream(channel_id):
     token = request.args.get('token', '').strip()
@@ -162,7 +164,8 @@ def stream(channel_id):
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        if c.execute("SELECT unblock_time FROM blocked_ips WHERE ip=?", (ip,)).fetchone() and time.time() < c.execute("SELECT unblock_time FROM blocked_ips WHERE ip=?", (ip,)).fetchone()[0]:
+        row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip=?", (ip,)).fetchone()
+        if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, request.referrer or '')
@@ -190,17 +193,39 @@ def stream(channel_id):
                         base = url.rsplit('/', 1)[0]
                         fixed = []
                         for line in res.text.splitlines():
-                            if line.strip().startswith('#') or line.startswith('http'):
+                            if line.strip().startswith('#'):
                                 fixed.append(line)
                             elif line.strip():
-                                fixed.append(f'{base}/{line.strip()}')
+                                full = f"{base}/{line.strip()}"
+                                proxied = f"https://{request.host}/segment?url={full}&token={token}"
+                                fixed.append(proxied)
                         return Response('\n'.join(fixed), content_type=content_type)
                     return Response(stream_with_context(res.iter_content(1024)), content_type=content_type)
                 except:
                     return abort(500, 'Error fetching stream')
         return abort(404, 'Stream not found')
 
-# ---------------- UNLOCK TOKEN PAGE ---------------- #
+# ---------------- SEGMENT PROXY ---------------- #
+@app.route('/segment')
+def segment():
+    token = request.args.get('token', '').strip()
+    real_url = request.args.get('url', '').strip()
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', '').lower()
+
+    if is_sniffer(ip, ua):
+        with sqlite3.connect(DB) as conn:
+            log_block(conn.cursor(), ip, token, ua, request.referrer or '')
+            conn.commit()
+        return render_template('sniffer_blocked.html'), 403
+
+    try:
+        res = requests.get(unquote(real_url), headers={'User-Agent': 'Mozilla/5.0'}, stream=True, timeout=10)
+        return Response(stream_with_context(res.iter_content(1024)), content_type=res.headers.get('Content-Type'))
+    except:
+        return abort(500, 'Segment error')
+
+# ---------------- TOKEN GENERATOR ---------------- #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
