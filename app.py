@@ -1,14 +1,15 @@
-from flask import Flask, request, redirect, render_template, session, abort, Response
+from flask import Flask, request, redirect, render_template, session, abort, Response, send_file
 from functools import wraps
 from datetime import datetime, timedelta
 import sqlite3, os, uuid, requests, time
 from cryptography.fernet import Fernet
+from io import BytesIO
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
 DB = 'database.db'
 MAX_DEVICES = 4
-BLOCK_DURATION = 300
+BLOCK_DURATION = 300  # seconds
 FERNET_KEY = Fernet.generate_key()
 fernet = Fernet(FERNET_KEY)
 
@@ -44,7 +45,7 @@ def init_db():
             unblock_time REAL)''')
 init_db()
 
-# -------------- SNIFFER DETECTION -------------- #
+# -------------- Helpers -------------- #
 def is_sniffer(ip, ua):
     ua = ua.lower()
     return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
@@ -55,23 +56,36 @@ def log_block(c, ip, token, ua, ref):
     c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
               (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
 
-# -------------- M3U PARSER -------------- #
-def parse_m3u_lines(lines, c):
+def parse_m3u(lines, c):
     name, logo = None, ''
     for line in lines:
         if line.startswith('#EXTINF:'):
             parts = line.split(',', 1)
             name = parts[1].strip()
-            logo_part = line.split('tvg-logo=\"')
+            logo_part = line.split('tvg-logo="')
             logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
         elif line.startswith('http'):
             url = line.strip()
             if name and url:
-                encrypted = fernet.encrypt(url.encode()).decode()
-                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, encrypted, logo))
+                encrypted_url = fernet.encrypt(url.encode()).decode()
+                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, encrypted_url, logo))
                 name, logo = None, ''
 
-# -------------- ADMIN PANEL -------------- #
+# ---------------- Admin routes ---------------- #
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        if request.form['username'] == 'admin' and request.form['password'] == 'admin':
+            session['admin'] = True
+            return redirect('/admin')
+        return 'Invalid credentials'
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.pop('admin', None)
+    return redirect('/login')
+
 @app.route('/admin', methods=['GET', 'POST'])
 def admin():
     if 'admin' not in session:
@@ -98,7 +112,7 @@ def admin():
                     headers = {'User-Agent': 'Mozilla/5.0'}
                     res = requests.get(url, headers=headers, timeout=10, verify=False)
                     if res.status_code == 200 and '#EXTM3U' in res.text:
-                        parse_m3u_lines(res.text.splitlines(), c)
+                        parse_m3u(res.text.splitlines(), c)
                 except Exception as e:
                     print("[ERROR]", e)
         conn.commit()
@@ -120,102 +134,7 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        if request.form['username'] == 'admin' and request.form['password'] == 'admin':
-            session['admin'] = True
-            return redirect('/admin')
-        return 'Invalid credentials'
-    return render_template('login.html')
-
-@app.route('/logout')
-def logout():
-    session.pop('admin', None)
-    return redirect('/login')
-
-# -------------- PLAYLIST -------------- #
-@app.route('/iptvplaylist.m3u')
-def playlist():
-    token = request.args.get('token', '').strip()
-    ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').strip().lower()
-    ref = request.referrer or ''
-
-    with sqlite3.connect(DB) as conn:
-        c = conn.cursor()
-        row = c.execute('SELECT unblock_time FROM blocked_ips WHERE ip = ?', (ip,)).fetchone()
-        if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
-        if is_sniffer(ip, ua):
-            log_block(c, ip, token, ua, ref)
-            conn.commit()
-            return render_template('sniffer_blocked.html'), 403
-        row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
-        if not row or row[1]:
-            return abort(403)
-        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
-            if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
-                c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
-                conn.commit()
-                return abort(403)
-            c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
-        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)', (datetime.utcnow().isoformat(), ip, token, ua, ref))
-        channels = c.execute('SELECT name, stream_url, logo_url FROM channels').fetchall()
-        conn.commit()
-
-    lines = ['#EXTM3U']
-    for name, encrypted_url, logo in channels:
-        try:
-            url = fernet.decrypt(encrypted_url.encode()).decode()
-            uid = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
-            proxy = f'https://{request.host}/stream?token={token}&channelid={uid}'
-            lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
-            lines.append(proxy)
-        except:
-            continue
-    return Response('\n'.join(lines), mimetype='application/x-mpegURL')
-
-# -------------- PROXY STREAM -------------- #
-@app.route('/stream')
-def stream():
-    token = request.args.get('token', '').strip()
-    channelid = request.args.get('channelid', '').strip()
-    ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').lower()
-
-    with sqlite3.connect(DB) as conn:
-        c = conn.cursor()
-        if c.execute('SELECT unblock_time FROM blocked_ips WHERE ip = ?', (ip,)).fetchone():
-            return render_template('sniffer_blocked.html'), 403
-        if is_sniffer(ip, ua):
-            log_block(c, ip, token, ua, request.referrer or '')
-            conn.commit()
-            return render_template('sniffer_blocked.html'), 403
-        row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
-        if not row or row[1]:
-            return abort(403)
-        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
-            if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
-                c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
-                conn.commit()
-                return abort(403)
-            c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
-        for row in c.execute('SELECT stream_url FROM channels'):
-            try:
-                url = fernet.decrypt(row[0].encode()).decode()
-                if str(uuid.uuid5(uuid.NAMESPACE_URL, url)) == channelid:
-                    def generate():
-                        with requests.get(url, stream=True, headers={'User-Agent': 'Mozilla/5.0'}) as r:
-                            for chunk in r.iter_content(chunk_size=4096):
-                                if chunk:
-                                    yield chunk
-                    return Response(generate(), content_type='application/vnd.apple.mpegurl')
-            except:
-                continue
-        return abort(404)
-
-# -------------- UNLOCK -------------- #
+# ---------------- Token unlock ---------------- #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
@@ -227,9 +146,117 @@ def unlock():
             conn.commit()
     return render_template('unlock.html', token=token)
 
-@app.route('/not-allowed')
-def not_allowed():
-    return render_template('not_allowed.html')
+# ---------------- Playlist generation ---------------- #
+@app.route('/iptvplaylist.m3u')
+def playlist():
+    token = request.args.get('token', '').strip()
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', '').strip().lower()
+    ref = request.referrer or ''
 
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+
+        # Check block
+        row = c.execute('SELECT unblock_time FROM blocked_ips WHERE ip = ?', (ip,)).fetchone()
+        if row and time.time() < row[0]:
+            return render_template('sniffer_blocked.html'), 403
+
+        if is_sniffer(ip, ua):
+            log_block(c, ip, token, ua, ref)
+            conn.commit()
+            return render_template('sniffer_blocked.html'), 403
+
+        row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
+        if not row or row[1]:
+            return abort(403)
+
+        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
+            if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
+                c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+                conn.commit()
+                return abort(403)
+            c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+
+        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)', (datetime.utcnow().isoformat(), ip, token, ua, ref))
+
+        channels = c.execute('SELECT name, stream_url, logo_url FROM channels').fetchall()
+        conn.commit()
+
+    lines = ['#EXTM3U']
+    for name, encrypted_url, logo in channels:
+        try:
+            url = fernet.decrypt(encrypted_url.encode()).decode()
+            uid = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
+            proxy_url = f'https://{request.host}/stream?token={token}&channelid={uid}'
+            lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
+            lines.append(proxy_url)
+        except:
+            continue
+
+    return Response('\n'.join(lines), mimetype='application/x-mpegURL')
+
+# ---------------- Proxy stream ---------------- #
+@app.route('/stream')
+def stream():
+    token = request.args.get('token', '').strip()
+    channelid = request.args.get('channelid', '').strip()
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', '').lower()
+    ref = request.referrer or ''
+
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+
+        # Block check
+        row = c.execute('SELECT unblock_time FROM blocked_ips WHERE ip = ?', (ip,)).fetchone()
+        if row and time.time() < row[0]:
+            return render_template('sniffer_blocked.html'), 403
+
+        if is_sniffer(ip, ua):
+            log_block(c, ip, token, ua, ref)
+            conn.commit()
+            return render_template('sniffer_blocked.html'), 403
+
+        row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
+        if not row or row[1]:
+            return abort(403)
+
+        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
+            if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
+                c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+                conn.commit()
+                return abort(403)
+            c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+
+        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)', (datetime.utcnow().isoformat(), ip, token, ua, ref))
+
+        # Find channel url by channelid
+        for row in c.execute('SELECT stream_url FROM channels'):
+            try:
+                url = fernet.decrypt(row[0].encode()).decode()
+                if str(uuid.uuid5(uuid.NAMESPACE_URL, url)) == channelid:
+                    # Proxy the remote stream (handle .m3u8 and .ts)
+                    # Detect segment requests
+                    if request.query_string:
+                        # Pass query strings
+                        proxied_url = url + '?' + request.query_string.decode()
+                    else:
+                        proxied_url = url
+
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    r = requests.get(proxied_url, headers=headers, stream=True, timeout=10)
+                    def generate():
+                        for chunk in r.iter_content(chunk_size=4096):
+                            if chunk:
+                                yield chunk
+                    content_type = r.headers.get('Content-Type', 'application/vnd.apple.mpegurl')
+                    return Response(generate(), content_type=content_type)
+            except:
+                continue
+
+    return abort(404)
+
+# ---------------- Run app ---------------- #
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
