@@ -2,7 +2,7 @@ from flask import Flask, request, redirect, render_template, session, abort, Res
 from functools import wraps
 from datetime import datetime, timedelta
 import sqlite3, os, uuid, requests, time, re
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urljoin, urlparse
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
@@ -13,8 +13,6 @@ BLOCK_DURATION = 300
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
 ALLOWED_AGENTS = ['ottnavigator', 'test']
 
-# Initialize DB
-
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -24,8 +22,6 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, stream_url TEXT, logo_url TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (ip TEXT PRIMARY KEY, unblock_time REAL)''')
 init_db()
-
-# Admin auth
 
 def login_required(f):
     @wraps(f)
@@ -92,8 +88,6 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
-# Utilities
-
 def parse_m3u_lines(lines, c):
     name, logo = None, ''
     for line in lines:
@@ -120,18 +114,92 @@ def log_block(c, ip, token, ua, ref):
     c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
               (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
 
-@app.route('/iptvplaylist.m3u')
-def playlist():
+def rewrite_master_playlist(content, base_url):
+    lines = []
+    for line in content.splitlines():
+        if line.strip().endswith('.m3u8'):
+            full_url = urljoin(base_url, line.strip())
+            filename = os.path.basename(full_url)
+            lines.append(f"/stream_sub/{filename}")
+        else:
+            lines.append(line)
+    return '\n'.join(lines)
+
+def rewrite_media_playlist(content, base_url):
+    lines = []
+    for line in content.splitlines():
+        if line.startswith("#"):
+            lines.append(line)
+        elif line.strip().endswith(".ts"):
+            name = os.path.basename(line.strip())
+            lines.append(f"/segment_proxy/{name}")
+        else:
+            lines.append(line)
+    return '\n'.join(lines)
+
+def is_master_playlist(content):
+    return '#EXT-X-STREAM-INF' in content
+
+def fetch_and_rewrite(url, depth=0):
+    if depth > 3:
+        return "#EXTM3U\n#EXTINF:0,Too many redirects"
+    res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+    content = res.text
+    if is_master_playlist(content):
+        return rewrite_master_playlist(content, url)
+    else:
+        return rewrite_media_playlist(content, url)
+
+@app.route('/stream_sub/<path:filename>')
+def stream_sub(filename):
     token = request.args.get('token', '').strip()
     ip = request.remote_addr
     ua = request.headers.get('User-Agent', '').lower()
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        if c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone():
+        row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
+        if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, request.referrer or '')
+            c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+            conn.commit()
+            return render_template('sniffer_blocked.html'), 403
+
+    original_url = f"https://your.cdn.server/path/{filename}"
+    try:
+        res = requests.get(original_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        content = res.text
+        return Response(rewrite_media_playlist(content, original_url), mimetype='application/x-mpegURL')
+    except Exception as e:
+        print(f"[ERROR] Could not fetch sub-playlist: {e}")
+        return abort(404)
+
+@app.route('/segment_proxy/<path:name>')
+def segment_proxy(name):
+    try:
+        real_segment_url = f"https://your.cdn.server/segments/{name}"
+        res = requests.get(real_segment_url, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, timeout=10)
+        return Response(stream_with_context(res.iter_content(1024)), content_type=res.headers.get('Content-Type'))
+    except Exception as e:
+        print(f"[ERROR] Segment fetch failed: {e}")
+        return abort(500)
+
+@app.route('/iptvplaylist.m3u')
+def playlist():
+    token = request.args.get('token', '').strip()
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', '').lower()
+    ref = request.referrer or ''
+
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+        row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
+        if row and time.time() < row[0]:
+            return render_template('sniffer_blocked.html'), 403
+        if is_sniffer(ip, ua):
+            log_block(c, ip, token, ua, ref)
             c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
@@ -147,6 +215,8 @@ def playlist():
                 return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
+        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                  (datetime.utcnow().isoformat(), ip, token, ua, ref))
         c.execute('SELECT name, stream_url, logo_url FROM channels')
         channels = c.fetchall()
         conn.commit()
@@ -191,50 +261,9 @@ def stream(channel_id):
         c.execute('SELECT stream_url FROM channels')
         for (url,) in c.fetchall():
             if str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip())) == str(channel_id):
-                return proxy_playlist(url)
+                rewritten = fetch_and_rewrite(url)
+                return Response(rewritten, content_type='application/vnd.apple.mpegurl')
         return abort(404, 'Stream not found')
-
-# Rewriter that handles master/media playlists with segment rewriting
-
-def proxy_playlist(url):
-    res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-    content = res.text
-    if '#EXT-X-STREAM-INF' in content:
-        return Response(rewrite_master_playlist(content, url), mimetype='application/vnd.apple.mpegurl')
-    else:
-        return Response(rewrite_media_playlist(content, url), mimetype='application/vnd.apple.mpegurl')
-
-def rewrite_master_playlist(content, base_url):
-    lines = []
-    for line in content.splitlines():
-        if line.strip().endswith('.m3u8'):
-            full_url = urljoin(base_url, line.strip())
-            uid = re.sub(r'[^a-zA-Z0-9]', '', full_url[-32:])
-            lines.append(f"/stream_sub/{uid}.m3u8")
-        else:
-            lines.append(line)
-    return '\n'.join(lines)
-
-def rewrite_media_playlist(content, base_url):
-    lines = []
-    for line in content.splitlines():
-        if line.strip().endswith('.ts'):
-            full_url = urljoin(base_url, line.strip())
-            name = os.path.basename(full_url)
-            lines.append(f"/segment_proxy/{name}")
-        else:
-            lines.append(line)
-    return '\n'.join(lines)
-
-@app.route('/segment_proxy/<path:name>')
-def segment_proxy(name):
-    # You must map this to original source or CDN
-    url = f"https://your.cdn.net/segments/{name}"
-    try:
-        res = requests.get(url, stream=True, timeout=10)
-        return Response(stream_with_context(res.iter_content(1024)), content_type=res.headers.get('Content-Type'))
-    except:
-        return abort(500)
 
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
