@@ -120,7 +120,6 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
-# -------------- AUTH -------------- #
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -145,7 +144,8 @@ def playlist():
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        if c.execute('SELECT unblock_time FROM blocked_ips WHERE ip = ?', (ip,)).fetchone():
+        row = c.execute('SELECT unblock_time FROM blocked_ips WHERE ip = ?', (ip,)).fetchone()
+        if row and time.time() < row[0]:
             return render_template('sniffer_blocked.html'), 403
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, ref)
@@ -210,7 +210,7 @@ def stream():
                             for chunk in r.iter_content(chunk_size=4096):
                                 if chunk:
                                     yield chunk
-                    return Response(generate(), content_type=r.headers.get('Content-Type', 'application/vnd.apple.mpegurl'))
+                    return Response(generate(), content_type='application/vnd.apple.mpegurl')
             except:
                 continue
         return abort(404)
