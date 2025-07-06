@@ -85,6 +85,18 @@ def admin():
                 logo = request.form['logo']
                 encrypted_url = fernet.encrypt(stream.encode()).decode()
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, encrypted_url, logo))
+            elif 'm3u_url' in request.form:
+                try:
+                    url = request.form['m3u_url'].strip()
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    res = requests.get(url, headers=headers, timeout=10, verify=False)
+                    if res.status_code == 200 and '#EXTM3U' in res.text:
+                        lines = res.text.splitlines()
+                        parse_m3u_lines(lines, c)
+                    else:
+                        print('[ERROR] Invalid M3U response')
+                except Exception as e:
+                    print("[ERROR]", e)
         conn.commit()
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
@@ -102,6 +114,25 @@ def delete_channel(id):
         conn.execute('DELETE FROM channels WHERE id = ?', (id,))
         conn.commit()
     return redirect('/admin')
+
+# ------------------------ M3U PARSER ------------------------ #
+def parse_m3u_lines(lines, c):
+    name, logo = None, ''
+    for line in lines:
+        if line.startswith('#EXTINF:'):
+            try:
+                parts = line.split(',', 1)
+                name = parts[1].strip()
+                logo_part = line.split('tvg-logo="')
+                logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
+            except:
+                continue
+        elif line.startswith('http'):
+            url = line.strip()
+            if name and url:
+                encrypted = fernet.encrypt(url.encode()).decode()
+                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, encrypted, logo))
+                name, logo = None, ''
 
 # ------------------------ SECURITY ------------------------ #
 def is_sniffer(ip, ua):
