@@ -25,26 +25,46 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS restream_processes (channel_id INTEGER PRIMARY KEY, pid INTEGER)''')
 init_db()
 
+# ------------------------ LOGIN SYSTEM ------------------------ #
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if 'admin' not in session:
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return wrapper
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        if request.form['username'] == 'admin' and request.form['password'] == 'admin':
+            session['admin'] = True
+            return redirect('/admin')
+        return 'Invalid credentials'
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.pop('admin', None)
+    return redirect('/login')
+
 # ------------------------ RESTREAM FUNCTIONS ------------------------ #
 def start_restream(channel_id, original_url, restream_url):
     try:
-        # Store the original URL before restreaming
         with sqlite3.connect(DB) as conn:
             c = conn.cursor()
             c.execute('UPDATE channels SET original_url = ?, is_restreamed = 1 WHERE id = ?', 
                      (original_url, channel_id))
             conn.commit()
 
-        # FFmpeg command for restreaming (adjust as needed)
         cmd = [
             'ffmpeg',
             '-i', original_url,
-            '-c', 'copy',       # Copy all streams without re-encoding
-            '-f', 'mpegts',     # Output format
+            '-c', 'copy',
+            '-f', 'mpegts',
             restream_url
         ]
         
-        # Start the process and store the PID
         process = subprocess.Popen(cmd)
         with sqlite3.connect(DB) as conn:
             conn.execute('INSERT OR REPLACE INTO restream_processes(channel_id, pid) VALUES (?, ?)', 
@@ -63,44 +83,83 @@ def stop_restream(channel_id):
             if row:
                 pid = row[0]
                 try:
-                    os.kill(pid, 9)  # Forcefully kill the process
+                    os.kill(pid, 9)
                 except ProcessLookupError:
-                    pass  # Process already dead
+                    pass
                 
-            # Reset the channel to original URL
             c.execute('SELECT original_url FROM channels WHERE id = ?', (channel_id,))
             original_url = c.fetchone()[0]
             if original_url:
                 c.execute('UPDATE channels SET stream_url = ?, is_restreamed = 0 WHERE id = ?', 
                          (original_url, channel_id))
             
-            # Clean up
             c.execute('DELETE FROM restream_processes WHERE channel_id = ?', (channel_id,))
             conn.commit()
             
     except Exception as e:
         print(f"Error stopping restream for channel {channel_id}: {e}")
 
-# ------------------------ RESTREAM ROUTES ------------------------ #
+# ------------------------ ADMIN PANEL ------------------------ #
+@app.route('/admin', methods=['GET', 'POST'])
+@login_required
+def admin():
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+        if request.method == 'POST':
+            if 'add_token' in request.form:
+                token = request.form['token'].strip()
+                days = int(request.form['days'])
+                expiry = (datetime.utcnow() + timedelta(days=days)).isoformat()
+                c.execute('INSERT OR REPLACE INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'admin'))
+
+            elif 'add_channel' in request.form:
+                name = request.form['name']
+                stream = request.form['stream']
+                logo = request.form['logo']
+                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, stream, logo))
+
+            elif 'm3u_url' in request.form:
+                m3u_url = request.form['m3u_url'].strip()
+                try:
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    res = requests.get(m3u_url, headers=headers, timeout=10, verify=False)
+                    if res.status_code == 200:
+                        lines = res.text.splitlines()
+                        parse_m3u_lines(lines, c)
+                except Exception as e:
+                    print(f"[ERROR] M3U fetch failed: {e}")
+
+            conn.commit()
+
+        c.execute('SELECT * FROM tokens')
+        tokens = c.fetchall()
+        token_data = [(t[0], t[1], c.execute('SELECT COUNT(*) FROM token_ips WHERE token=?', (t[0],)).fetchone()[0], t[2], t[3]) for t in tokens]
+        c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100')
+        logs = c.fetchall()
+        c.execute('SELECT id, name, stream_url, logo_url, is_restreamed FROM channels')
+        channels = c.fetchall()
+        return render_template('admin.html', tokens=token_data, logs=logs, channels=channels)
+
+@app.route('/admin/delete_channel/<int:id>')
+@login_required
+def delete_channel(id):
+    with sqlite3.connect(DB) as conn:
+        conn.execute('DELETE FROM channels WHERE id = ?', (id,))
+        conn.commit()
+    return redirect('/admin')
+
 @app.route('/admin/restream/<int:channel_id>')
 @login_required
 def restream_channel(channel_id):
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        
-        # Get the channel details
         c.execute('SELECT id, name, stream_url FROM channels WHERE id = ?', (channel_id,))
         channel = c.fetchone()
         if not channel:
             return abort(404, 'Channel not found')
         
-        # Generate a new stream URL on your server
         restream_url = f"http://{request.host}/restream/{channel_id}"
-        
-        # Start restreaming in a separate thread
         threading.Thread(target=start_restream, args=(channel_id, channel[2], restream_url), daemon=True).start()
-        
-        # Update the database to use the new URL immediately
         c.execute('UPDATE channels SET stream_url = ? WHERE id = ?', (restream_url, channel_id))
         conn.commit()
         
@@ -112,10 +171,118 @@ def stop_restream_channel(channel_id):
     stop_restream(channel_id)
     return redirect('/admin')
 
+# ------------------------ M3U PARSER ------------------------ #
+def parse_m3u_lines(lines, c):
+    name, logo = None, ''
+    for line in lines:
+        if line.startswith('#EXTINF:'):
+            try:
+                parts = line.split(',', 1)
+                name = parts[1].strip()
+                logo_part = line.split('tvg-logo="')
+                logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
+            except:
+                continue
+        elif line.startswith('http'):
+            url = line.strip()
+            if name and url:
+                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
+                name, logo = None, ''
+
+# ------------------------ SNIFFER CHECK ------------------------ #
+def is_sniffer(ip, ua):
+    return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
+
+def log_block(c, ip, token, ua, ref):
+    unblock_time = time.time() + BLOCK_DURATION
+    c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
+    c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
+              (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
+
+# ------------------------ IPTV PLAYLIST ------------------------ #
+@app.route('/iptvplaylist.m3u')
+def playlist():
+    token = request.args.get('token', '').strip()
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', '').lower()
+    ref = request.referrer or ''
+
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+        row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
+        if row and time.time() < row[0]:
+            return render_template('sniffer_blocked.html'), 403
+        if is_sniffer(ip, ua):
+            log_block(c, ip, token, ua, ref)
+            conn.commit()
+            return render_template('sniffer_blocked.html'), 403
+
+        row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
+        if not row or row[1]:
+            return abort(403, 'Invalid or banned token')
+
+        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
+            if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
+                c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+                conn.commit()
+                return abort(403, 'Device limit exceeded')
+            c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+
+        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                  (datetime.utcnow().isoformat(), ip, token, ua, ref))
+        c.execute('SELECT name, stream_url, logo_url FROM channels')
+        channels = c.fetchall()
+        conn.commit()
+
+    lines = ['#EXTM3U']
+    for name, url, logo in channels:
+        uid = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
+        proxy = f"https://{request.host}/stream/{uid}?token={token}"
+        lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
+        lines.append(proxy)
+
+    return Response('\n'.join(lines), mimetype='application/x-mpegURL')
+
+# ------------------------ STREAM PROXY ------------------------ #
+@app.route('/stream/<uuid:channel_id>')
+def stream(channel_id):
+    token = request.args.get('token', '').strip()
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', '').lower()
+
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+        row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
+        if row and time.time() < row[0]:
+            return render_template('sniffer_blocked.html'), 403
+        if is_sniffer(ip, ua):
+            log_block(c, ip, token, ua, request.referrer or '')
+            conn.commit()
+            return render_template('sniffer_blocked.html'), 403
+
+        row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
+        if not row or row[1]:
+            return abort(403, 'Invalid or banned token')
+
+        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
+            if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
+                c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+                conn.commit()
+                return abort(403, 'Device limit exceeded')
+            c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+
+        c.execute('SELECT stream_url FROM channels')
+        for (url,) in c.fetchall():
+            if str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip())) == str(channel_id):
+                try:
+                    res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, timeout=10)
+                    return Response(stream_with_context(res.iter_content(1024)), content_type=res.headers.get('Content-Type'))
+                except:
+                    return abort(500, 'Error fetching stream')
+        return abort(404, 'Stream not found')
+
 @app.route('/restream/<int:channel_id>')
 def serve_restream(channel_id):
-    # This endpoint would typically be handled by your streaming server
-    # For this example, we'll proxy the request to the original URL
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
         c.execute('SELECT original_url FROM channels WHERE id = ? AND is_restreamed = 1', (channel_id,))
@@ -131,32 +298,23 @@ def serve_restream(channel_id):
         except Exception as e:
             return abort(502, f'Restream proxy error: {str(e)}')
 
-# ------------------------ LOGIN SYSTEM ------------------------ #
-# ... [keep all your existing login system code unchanged] ...
+# ------------------------ TOKEN GENERATOR ------------------------ #
+@app.route('/unlock', methods=['GET', 'POST'])
+def unlock():
+    token = None
+    if request.method == 'POST':
+        token = uuid.uuid4().hex[:12]
+        expiry = (datetime.utcnow() + timedelta(days=30)).isoformat()
+        with sqlite3.connect(DB) as conn:
+            conn.execute('INSERT INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'user'))
+            conn.commit()
+    return render_template('unlock.html', token=token)
 
-# ------------------------ ADMIN PANEL ------------------------ #
-@app.route('/admin', methods=['GET', 'POST'])
-@login_required
-def admin():
-    with sqlite3.connect(DB) as conn:
-        c = conn.cursor()
-        if request.method == 'POST':
-            # ... [keep all your existing POST handling code] ...
-            pass
-
-        c.execute('SELECT * FROM tokens')
-        tokens = c.fetchall()
-        token_data = [(t[0], t[1], c.execute('SELECT COUNT(*) FROM token_ips WHERE token=?', (t[0],)).fetchone()[0], t[2], t[3]) for t in tokens]
-        c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100')
-        logs = c.fetchall()
-        c.execute('SELECT id, name, stream_url, logo_url, is_restreamed FROM channels')
-        channels = c.fetchall()
-        return render_template('admin.html', tokens=token_data, logs=logs, channels=channels)
-
-# ... [keep all your other existing routes and functions unchanged] ...
+@app.route('/not-allowed')
+def not_allowed():
+    return render_template('not_allowed.html')
 
 if __name__ == '__main__':
-    # Clean up any running restream processes on startup
     with sqlite3.connect(DB) as conn:
         conn.execute('DELETE FROM restream_processes')
         conn.execute('UPDATE channels SET is_restreamed = 0')
