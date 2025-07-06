@@ -7,12 +7,12 @@ app = Flask(__name__)
 app.secret_key = 'supersecretkey'
 DB = 'database.db'
 MAX_DEVICES = 4
-BLOCK_DURATION = 300  # seconds
+BLOCK_DURATION = 300
 
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
 ALLOWED_AGENTS = ['ottnavigator', 'test', 'vlc', 'tivimate']
 
-# ------------------------ DB INIT ------------------------ #
+# ---------------- DB INIT ---------------- #
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -23,7 +23,7 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (ip TEXT PRIMARY KEY, unblock_time REAL)''')
 init_db()
 
-# ------------------------ HELPERS ------------------------ #
+# ---------------- HELPERS ---------------- #
 def is_sniffer(ip, ua):
     return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
 
@@ -50,7 +50,7 @@ def validate_token(c, token, ip):
         c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
     return True, "Valid"
 
-# ------------------------ LOGIN SYSTEM ------------------------ #
+# ---------------- AUTH ---------------- #
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -73,7 +73,7 @@ def logout():
     session.pop('admin', None)
     return redirect('/login')
 
-# ------------------------ ADMIN PANEL ------------------------ #
+# ---------------- ADMIN ---------------- #
 @app.route('/admin', methods=['GET', 'POST'])
 @login_required
 def admin():
@@ -93,10 +93,8 @@ def admin():
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, stream, logo))
 
             elif 'm3u_url' in request.form:
-                m3u_url = request.form['m3u_url'].strip()
                 try:
-                    headers = {'User-Agent': 'Mozilla/5.0'}
-                    res = requests.get(m3u_url, headers=headers, timeout=10, verify=False)
+                    res = requests.get(request.form['m3u_url'].strip(), headers={'User-Agent': 'Mozilla/5.0'}, timeout=10, verify=False)
                     if res.status_code == 200:
                         parse_m3u_lines(res.text.splitlines(), c)
                 except Exception as e:
@@ -112,6 +110,23 @@ def admin():
         channels = c.fetchall()
         return render_template('admin.html', tokens=token_data, logs=logs, channels=channels)
 
+@app.route('/admin/delete_token/<token>')
+@login_required
+def delete_token(token):
+    with sqlite3.connect(DB) as conn:
+        conn.execute("DELETE FROM tokens WHERE token = ?", (token,))
+        conn.execute("DELETE FROM token_ips WHERE token = ?", (token,))
+        conn.commit()
+    return redirect('/admin')
+
+@app.route('/admin/unban/<token>')
+@login_required
+def unban_token(token):
+    with sqlite3.connect(DB) as conn:
+        conn.execute("UPDATE tokens SET banned = 0 WHERE token = ?", (token,))
+        conn.commit()
+    return redirect('/admin')
+
 @app.route('/admin/delete_channel/<int:id>')
 @login_required
 def delete_channel(id):
@@ -120,7 +135,7 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
-# ------------------------ M3U PARSER ------------------------ #
+# ---------------- M3U PARSER ---------------- #
 def parse_m3u_lines(lines, c):
     name, logo = None, ''
     for line in lines:
@@ -128,8 +143,7 @@ def parse_m3u_lines(lines, c):
             try:
                 parts = line.split(',', 1)
                 name = parts[1].strip()
-                logo_part = line.split('tvg-logo="')
-                logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
+                logo = line.split('tvg-logo="')[1].split('"')[0] if 'tvg-logo="' in line else ''
             except:
                 continue
         elif line.startswith('http'):
@@ -138,7 +152,7 @@ def parse_m3u_lines(lines, c):
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
                 name, logo = None, ''
 
-# ------------------------ IPTV PLAYLIST ------------------------ #
+# ---------------- PLAYLIST ---------------- #
 @app.route('/iptvplaylist.m3u')
 def playlist():
     token = request.args.get('token', '').strip()
@@ -163,7 +177,6 @@ def playlist():
 
         valid, reason = validate_token(c, token, ip)
         if not valid:
-            print(f"[403] {reason} for token={token} ip={ip}")
             conn.commit()
             return abort(403, reason)
 
@@ -182,7 +195,7 @@ def playlist():
 
     return Response('\n'.join(lines), mimetype='application/x-mpegURL')
 
-# ------------------------ STREAM PROXY ------------------------ #
+# ---------------- STREAM ---------------- #
 @app.route('/stream/<uuid:channel_id>')
 def stream(channel_id):
     token = request.args.get('token', '').strip()
@@ -219,7 +232,7 @@ def stream(channel_id):
                     return abort(500, 'Error fetching stream')
         return abort(404, 'Stream not found')
 
-# ------------------------ TOKEN UNLOCK ------------------------ #
+# ---------------- TOKEN GENERATOR ---------------- #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
