@@ -206,6 +206,11 @@ def admin():
             name = request.form.get('name')
             logo = request.form.get('logo')
             url = request.form.get('url')
+
+            if not url or not name or not logo:
+                flash('All fields are required.', 'danger')
+                return redirect(url_for('admin'))
+
             encrypted = fernet.encrypt(url.encode()).decode()
             c.execute('INSERT INTO channels (name, stream_url, logo_url) VALUES (?, ?, ?)', (name, encrypted, logo))
             conn.commit()
