@@ -1,17 +1,23 @@
-from flask import Flask, request, redirect, render_template, session, abort, Response, send_file
+from flask import Flask, request, abort, Response, render_template
 from functools import wraps
-from datetime import datetime, timedelta
-import sqlite3, os, uuid, requests, time
+from datetime import datetime
+import sqlite3
+import os
+import uuid
+import requests
+import time
 from cryptography.fernet import Fernet
+from urllib.parse import urljoin, urlparse
 from io import BytesIO
 
 app = Flask(__name__)
-app.secret_key = 'supersecretkey'
+app.secret_key = os.getenv('SECRET_KEY', 'supersecretkey')  # Use environment variable
 DB = 'database.db'
 MAX_DEVICES = 4
 BLOCK_DURATION = 300  # seconds
+REQUEST_TIMEOUT = 15  # seconds for upstream requests
 
-# Persist Fernet key to file so encryption survives restarts
+# Persist Fernet key
 if os.path.exists('fernet.key'):
     with open('fernet.key', 'rb') as f:
         FERNET_KEY = f.read()
@@ -23,9 +29,9 @@ else:
 fernet = Fernet(FERNET_KEY)
 
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
-ALLOWED_AGENTS = ['dalvik', 'ott', 'navigator', 'ott navigator', 'ott-navigator', 'ottnavigator', 'tivimate', 'test']
+ALLOWED_AGENTS = ['dalvik', 'ott', 'navigator', 'ott navigator', 'ott-navigator', 'ottnavigator', 'tivimate', 'test', 'vlc', 'kodi']
 
-# -------------- DB INIT -------------- #
+# Database initialization
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -43,7 +49,8 @@ def init_db():
             ip TEXT,
             token TEXT,
             user_agent TEXT,
-            referrer TEXT)''')
+            referrer TEXT,
+            path TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
@@ -52,60 +59,105 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (
             ip TEXT PRIMARY KEY,
             unblock_time REAL)''')
+        conn.commit()
 init_db()
 
-# -------------- Helpers -------------- #
-def is_sniffer(ip, ua):
+# Helper functions
+def is_sniffer(ua):
+    if not ua:
+        return True
     ua = ua.lower()
     return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
 
-def log_block(c, ip, token, ua, ref):
+def log_request(c, ip, token, ua, ref, path):
+    c.execute('''INSERT INTO logs(timestamp, ip, token, user_agent, referrer, path) 
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref, path))
+
+def log_block(c, ip, token, ua, ref, path):
     unblock_time = time.time() + BLOCK_DURATION
-    c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
-    c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
-              (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
+    c.execute('''INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) 
+                 VALUES (?, ?)''', (ip, unblock_time))
+    log_request(c, ip, token, ua, ref, path)
 
 def check_token_and_ip(c, token, ip):
-    row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
-    if not row or row[1]:
+    if not token:
         return False
-    if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
-        if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
-            c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
-            return False
-        c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+        
+    row = c.execute('''SELECT expiry, banned FROM tokens 
+                       WHERE token = ?''', (token,)).fetchone()
+    if not row or row[1]:  # Token doesn't exist or is banned
+        return False
+        
+    # Check if IP is already associated with token
+    if c.execute('''SELECT 1 FROM token_ips 
+                    WHERE token = ? AND ip = ?''', (token, ip)).fetchone():
+        return True
+        
+    # Check device limit
+    device_count = c.execute('''SELECT COUNT(*) FROM token_ips 
+                               WHERE token = ?''', (token,)).fetchone()[0]
+    if device_count >= MAX_DEVICES:
+        c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+        return False
+        
+    # Add new IP association
+    c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
     return True
 
-# -------------- Playlist generation -------------- #
+def get_channel_url(c, channelid):
+    for row in c.execute('SELECT stream_url FROM channels'):
+        try:
+            decrypted_url = fernet.decrypt(row[0].encode()).decode()
+            if str(uuid.uuid5(uuid.NAMESPACE_URL, decrypted_url)) == channelid:
+                return decrypted_url
+        except:
+            continue
+    return None
+
+# Middleware to check blocked IPs and sniffers
+@app.before_request
+def before_request():
+    if request.path.startswith('/segment') or request.path.startswith('/stream'):
+        ip = request.remote_addr
+        ua = request.headers.get('User-Agent', '')
+        ref = request.referrer or ''
+        token = request.args.get('token', '').strip()
+        
+        with sqlite3.connect(DB) as conn:
+            c = conn.cursor()
+            
+            # Check if IP is blocked
+            row = c.execute('''SELECT unblock_time FROM blocked_ips 
+                              WHERE ip = ?''', (ip,)).fetchone()
+            if row and time.time() < row[0]:
+                log_request(c, ip, token, ua, ref, request.path)
+                conn.commit()
+                return render_template('sniffer_blocked.html'), 403
+                
+            # Check for sniffers
+            if is_sniffer(ua):
+                log_block(c, ip, token, ua, ref, request.path)
+                conn.commit()
+                return render_template('sniffer_blocked.html'), 403
+                
+            # Validate token
+            if not check_token_and_ip(c, token, ip):
+                log_request(c, ip, token, ua, ref, request.path)
+                conn.commit()
+                return abort(403)
+                
+            log_request(c, ip, token, ua, ref, request.path)
+            conn.commit()
+
+# Routes
 @app.route('/iptvplaylist.m3u')
 def playlist():
     token = request.args.get('token', '').strip()
-    ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').strip().lower()
-    ref = request.referrer or ''
-
+    
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-
-        # Check block
-        row = c.execute('SELECT unblock_time FROM blocked_ips WHERE ip = ?', (ip,)).fetchone()
-        if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
-
-        if is_sniffer(ip, ua):
-            log_block(c, ip, token, ua, ref)
-            conn.commit()
-            return render_template('sniffer_blocked.html'), 403
-
-        if not check_token_and_ip(c, token, ip):
-            conn.commit()
-            return abort(403)
-
-        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
-                  (datetime.utcnow().isoformat(), ip, token, ua, ref))
-
         channels = c.execute('SELECT name, stream_url, logo_url FROM channels').fetchall()
-        conn.commit()
 
     lines = ['#EXTM3U']
     for name, encrypted_url, logo in channels:
@@ -120,148 +172,106 @@ def playlist():
 
     return Response('\n'.join(lines), mimetype='application/x-mpegURL')
 
-# -------------- Proxy stream (playlist and .ts segment proxy) -------------- #
 @app.route('/stream')
 def stream():
-    token = request.args.get('token', '').strip()
     channelid = request.args.get('channelid', '').strip()
-    ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').lower()
-    ref = request.referrer or ''
-
+    if not channelid:
+        return abort(400)
+        
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-
-        # Block check
-        row = c.execute('SELECT unblock_time FROM blocked_ips WHERE ip = ?', (ip,)).fetchone()
-        if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
-
-        if is_sniffer(ip, ua):
-            log_block(c, ip, token, ua, ref)
-            conn.commit()
-            return render_template('sniffer_blocked.html'), 403
-
-        if not check_token_and_ip(c, token, ip):
-            conn.commit()
-            return abort(403)
-
-        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
-                  (datetime.utcnow().isoformat(), ip, token, ua, ref))
-
-        # Find channel url by channelid
-        url = None
-        for row in c.execute('SELECT stream_url FROM channels'):
-            try:
-                decrypted_url = fernet.decrypt(row[0].encode()).decode()
-                if str(uuid.uuid5(uuid.NAMESPACE_URL, decrypted_url)) == channelid:
-                    url = decrypted_url
-                    break
-            except:
-                continue
-
+        url = get_channel_url(c, channelid)
+        
     if not url:
         return abort(404)
 
-    # Proxy the remote stream (handle .m3u8 and .ts)
-    # Detect if this is a playlist file
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        proxied_url = url
-        if request.query_string:
-            proxied_url += '?' + request.query_string.decode()
-
-        r = requests.get(proxied_url, headers=headers, timeout=10)
-    except Exception:
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': '*/*',
+            'Connection': 'keep-alive'
+        }
+        proxied_url = f"{url}?{request.query_string.decode()}" if request.query_string else url
+        
+        r = requests.get(proxied_url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
+        r.raise_for_status()
+    except requests.RequestException:
         return abort(502)
 
     content_type = r.headers.get('Content-Type', '').lower()
     if 'application/vnd.apple.mpegurl' in content_type or proxied_url.endswith('.m3u8'):
-        # Rewrite playlist contents to proxy .ts segment requests
-        playlist_text = r.text
-
-        def rewrite_line(line):
-            line = line.strip()
-            if line and not line.startswith('#') and line.endswith('.ts'):
-                # Convert relative or absolute segment URLs into proxy URLs
-                # If segment URL is absolute, strip scheme+host and keep path only
-                segment = line
-                if segment.startswith('http://') or segment.startswith('https://'):
-                    from urllib.parse import urlparse
-                    p = urlparse(segment)
-                    segment = p.path.lstrip('/')
-                return f'https://{request.host}/segment?token={token}&channelid={channelid}&segment={segment}'
-            return line
-
-        new_playlist = '\n'.join(rewrite_line(line) for line in playlist_text.splitlines())
-        return Response(new_playlist, content_type='application/vnd.apple.mpegurl')
-
+        def rewrite_playlist(content):
+            for line in content.splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and (line.endswith('.ts') or '.ts?' in line):
+                    segment = line.split('/')[-1] if '/' in line else line
+                    yield f'https://{request.host}/segment?token={request.args.get("token")}&channelid={channelid}&segment={segment}\n'
+                else:
+                    yield f'{line}\n'
+                    
+        return Response(rewrite_playlist(r.text), content_type='application/vnd.apple.mpegurl')
+    
     def generate():
-        for chunk in r.iter_content(chunk_size=4096):
+        for chunk in r.iter_content(chunk_size=8192):
             if chunk:
                 yield chunk
+                
+    return Response(generate(), content_type=content_type or 'video/MP2T')
 
-    return Response(generate(), content_type=content_type or 'application/octet-stream')
-
-# -------------- Proxy .ts segments -------------- #
 @app.route('/segment')
 def segment():
-    token = request.args.get('token', '').strip()
     channelid = request.args.get('channelid', '').strip()
     segment = request.args.get('segment', '').strip()
-    ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').lower()
-    ref = request.referrer or ''
-
+    if not channelid or not segment:
+        return abort(400)
+        
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-
-        # Block check
-        row = c.execute('SELECT unblock_time FROM blocked_ips WHERE ip = ?', (ip,)).fetchone()
-        if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
-
-        if is_sniffer(ip, ua):
-            log_block(c, ip, token, ua, ref)
-            conn.commit()
-            return render_template('sniffer_blocked.html'), 403
-
-        if not check_token_and_ip(c, token, ip):
-            conn.commit()
-            return abort(403)
-
-        # Find the base stream URL for the channelid
-        url = None
-        for row in c.execute('SELECT stream_url FROM channels'):
-            try:
-                decrypted_url = fernet.decrypt(row[0].encode()).decode()
-                if str(uuid.uuid5(uuid.NAMESPACE_URL, decrypted_url)) == channelid:
-                    url = decrypted_url
-                    break
-            except:
-                continue
-
-    if not url:
+        base_url = get_channel_url(c, channelid)
+        
+    if not base_url:
         return abort(404)
 
-    # Compose full URL of the segment
-    # Remove trailing slash if present, then add '/'
-    segment_url = url.rstrip('/') + '/' + segment.lstrip('/')
-
+    # Construct proper segment URL
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        r = requests.get(segment_url, headers=headers, stream=True, timeout=10)
-    except Exception:
+        segment_url = urljoin(base_url + '/' if not base_url.endswith('/') else base_url, segment)
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': '*/*',
+            'Connection': 'keep-alive'
+        }
+        r = requests.get(segment_url, headers=headers, timeout=REQUEST_TIMEOUT, stream=True)
+        r.raise_for_status()
+    except requests.RequestException:
         return abort(502)
 
     def generate():
-        for chunk in r.iter_content(chunk_size=4096):
+        for chunk in r.iter_content(chunk_size=8192):
             if chunk:
                 yield chunk
+                
+    return Response(
+        generate(),
+        content_type=r.headers.get('Content-Type', 'video/MP2T'),
+        headers={
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
+        }
+    )
 
-    content_type = r.headers.get('Content-Type', 'video/mp2t')
-    return Response(generate(), content_type=content_type)
+@app.errorhandler(404)
+def not_found(e):
+    return render_template('404.html'), 404
 
-# ---------------- Run app ---------------- #
+@app.errorhandler(403)
+def forbidden(e):
+    return render_template('403.html'), 403
+
+@app.errorhandler(500)
+def server_error(e):
+    return render_template('500.html'), 500
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(host='0.0.0.0', port=5000, threaded=True)
