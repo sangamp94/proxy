@@ -145,45 +145,6 @@ def parse_m3u_lines(lines, c):
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
                 name, logo = None, ''
 
-@app.route('/iptvplaylist.m3u')
-def playlist():
-    token = request.args.get('token', '').strip()
-    ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').lower()
-    ref = request.referrer or ''
-
-    with sqlite3.connect(DB) as conn:
-        c = conn.cursor()
-
-        row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
-        if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
-        elif row:
-            c.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
-
-        if is_sniffer(ip, ua):
-            log_block(c, ip, token, ua, ref)
-            conn.commit()
-            return render_template('sniffer_blocked.html'), 403
-
-        valid, reason = validate_token(c, token, ip)
-        if not valid:
-            conn.commit()
-            return abort(403, reason)
-
-        c.execute('SELECT name, stream_url, logo_url FROM channels')
-        channels = c.fetchall()
-        conn.commit()
-
-    lines = ['#EXTM3U']
-    for name, url, logo in channels:
-        uid = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
-        proxy = f"https://{request.host}/stream/{uid}?token={token}"
-        lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
-        lines.append(proxy)
-
-    return Response('\n'.join(lines), mimetype='application/x-mpegURL')
-
 @app.route('/stream/<uuid:channel_id>')
 def stream(channel_id):
     token = request.args.get('token', '').strip()
@@ -217,24 +178,66 @@ def stream(channel_id):
                     content_type = res.headers.get('Content-Type', '')
                     if '.m3u8' in url or 'application/vnd.apple.mpegurl' in content_type:
                         playlist_text = res.text
-                        new_lines = []
-                        for line in playlist_text.splitlines():
-                            if line.strip().endswith('.ts'):
-                                segment = line.strip().split('/')[-1]
-                                proxied = f"https://{request.host}/segment/{channel_id}/{segment}?token={token}"
-                                new_lines.append(proxied)
-                            elif line.strip().startswith('#') or '.m3u8' not in line:
-                                new_lines.append(line)
-                            elif line.strip().endswith('.m3u8'):
-                                nested = line.strip().split('/')[-1]
-                                new_lines.append(f"https://{request.host}/stream/{channel_id}/{nested}?token={token}")
-                            else:
-                                new_lines.append(line)
-                        return Response('\n'.join(new_lines), mimetype='application/x-mpegURL')
-                    return Response(res.content, content_type=content_type)
+                        if '#EXT-X-STREAM-INF' in playlist_text:
+                            lines = playlist_text.splitlines()
+                            new_lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-INDEPENDENT-SEGMENTS']
+                            for i, line in enumerate(lines):
+                                if line.startswith('#EXT-X-STREAM-INF'):
+                                    next_line = lines[i + 1].strip()
+                                    variant = next_line.split('/')[-1]
+                                    proxy_url = f"https://{request.host}/stream/{channel_id}/{variant}?token={token}"
+                                    new_lines.append(line)
+                                    new_lines.append(proxy_url)
+                            return Response('\n'.join(new_lines), mimetype='application/x-mpegURL')
                 except:
                     return abort(500, 'Error fetching stream')
         return abort(404, 'Stream not found')
+
+@app.route('/stream/<uuid:channel_id>/<path:variant>')
+def variant_stream(channel_id, variant):
+    token = request.args.get('token', '').strip()
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', '').lower()
+
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+
+        row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
+        if row and time.time() < row[0]:
+            return render_template('sniffer_blocked.html'), 403
+        elif row:
+            c.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
+
+        if is_sniffer(ip, ua):
+            log_block(c, ip, token, ua, request.referrer or '')
+            conn.commit()
+            return render_template('sniffer_blocked.html'), 403
+
+        valid, reason = validate_token(c, token, ip)
+        if not valid:
+            conn.commit()
+            return abort(403, reason)
+
+        c.execute('SELECT stream_url FROM channels')
+        for (url,) in c.fetchall():
+            if str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip())) == str(channel_id):
+                base_url = url.rsplit('/', 1)[0]
+                target_url = f"{base_url}/{variant}"
+                try:
+                    res = requests.get(target_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+                    playlist_text = res.text
+                    new_lines = []
+                    for line in playlist_text.splitlines():
+                        if line.strip().endswith('.ts'):
+                            seg = line.strip().split('/')[-1]
+                            proxy_seg = f"https://{request.host}/segment/{channel_id}/{seg}?token={token}"
+                            new_lines.append(proxy_seg)
+                        else:
+                            new_lines.append(line)
+                    return Response('\n'.join(new_lines), mimetype='application/x-mpegURL')
+                except:
+                    return abort(500, 'Error fetching variant')
+        return abort(404, 'Variant not found')
 
 @app.route('/segment/<uuid:channel_id>/<path:segment>')
 def segment_proxy(channel_id, segment):
@@ -264,9 +267,9 @@ def segment_proxy(channel_id, segment):
         c.execute('SELECT stream_url FROM channels')
         for (url,) in c.fetchall():
             if str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip())) == str(channel_id):
+                base_url = url.rsplit('/', 1)[0]
+                segment_url = f"{base_url}/{segment}"
                 try:
-                    base_url = url.rsplit('/', 1)[0]
-                    segment_url = f"{base_url}/{segment}"
                     res = requests.get(segment_url, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, timeout=10)
                     return Response(stream_with_context(res.iter_content(1024)), content_type=res.headers.get('Content-Type'))
                 except:
