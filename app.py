@@ -1,8 +1,7 @@
-from flask import Flask, request, redirect, render_template, session, abort, Response, stream_with_context
+from flask import Flask, request, redirect, render_template, session, abort, Response, stream_with_context, send_from_directory
 from functools import wraps
 from datetime import datetime, timedelta
-import sqlite3, os, uuid, requests, time, re
-from urllib.parse import urljoin, urlparse
+import sqlite3, os, uuid, requests, time
 
 app = Flask(__name__)
 app.secret_key = 'supersecretkey'
@@ -38,7 +37,13 @@ def login():
             session['admin'] = True
             return redirect('/admin')
         return 'Invalid credentials'
-    return render_template('login.html')
+    return '''
+    <form method="post">
+        Username: <input name="username"><br>
+        Password: <input name="password" type="password"><br>
+        <input type="submit" value="Login">
+    </form>
+    '''
 
 @app.route('/logout')
 def logout():
@@ -61,14 +66,6 @@ def admin():
                 stream = request.form['stream']
                 logo = request.form['logo']
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, stream, logo))
-            elif 'm3u_url' in request.form:
-                try:
-                    res = requests.get(request.form['m3u_url'], timeout=10, verify=False)
-                    if res.status_code == 200:
-                        lines = res.text.splitlines()
-                        parse_m3u_lines(lines, c)
-                except Exception as e:
-                    print("M3U fetch failed:", e)
             conn.commit()
 
         c.execute('SELECT * FROM tokens')
@@ -78,32 +75,25 @@ def admin():
         logs = c.fetchall()
         c.execute('SELECT * FROM channels')
         channels = c.fetchall()
-        return render_template('admin.html', tokens=token_data, logs=logs, channels=channels)
+        return f'''
+        <h2>Tokens</h2>
+        {token_data}<br><br>
+        <form method="post">
+            Token: <input name="token"> Days: <input name="days" value="30"><input type="submit" name="add_token" value="Add Token">
+        </form>
+        <h2>Channels</h2>
+        {channels}<br><br>
+        <form method="post">
+            Name: <input name="name"> URL: <input name="stream"> Logo: <input name="logo">
+            <input type="submit" name="add_channel" value="Add Channel">
+        </form>
+        <h2>Logs</h2>
+        {logs}
+        '''
 
-@app.route('/admin/delete_channel/<int:id>')
-@login_required
-def delete_channel(id):
-    with sqlite3.connect(DB) as conn:
-        conn.execute('DELETE FROM channels WHERE id = ?', (id,))
-        conn.commit()
-    return redirect('/admin')
-
-def parse_m3u_lines(lines, c):
-    name, logo = None, ''
-    for line in lines:
-        if line.startswith('#EXTINF:'):
-            try:
-                parts = line.split(',', 1)
-                name = parts[1].strip()
-                logo_part = line.split('tvg-logo="')
-                logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
-            except:
-                continue
-        elif line.startswith('http'):
-            url = line.strip()
-            if name and url:
-                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
-                name, logo = None, ''
+@app.route('/media/<path:filename>')
+def serve_media(filename):
+    return send_from_directory('media', filename)
 
 def is_sniffer(ip, ua):
     return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
@@ -118,9 +108,7 @@ def rewrite_master_playlist(content, base_url):
     lines = []
     for line in content.splitlines():
         if line.strip().endswith('.m3u8'):
-            full_url = urljoin(base_url, line.strip())
-            filename = os.path.basename(full_url)
-            lines.append(f"/stream_sub/{filename}")
+            lines.append(f"/stream_sub/{line.strip()}")
         else:
             lines.append(line)
     return '\n'.join(lines)
@@ -131,8 +119,7 @@ def rewrite_media_playlist(content, base_url):
         if line.startswith("#"):
             lines.append(line)
         elif line.strip().endswith(".ts"):
-            name = os.path.basename(line.strip())
-            lines.append(f"/segment_proxy/{name}")
+            lines.append(f"/segment_proxy/{line.strip()}")
         else:
             lines.append(line)
     return '\n'.join(lines)
@@ -143,12 +130,15 @@ def is_master_playlist(content):
 def fetch_and_rewrite(url, depth=0):
     if depth > 3:
         return "#EXTM3U\n#EXTINF:0,Too many redirects"
-    res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-    content = res.text
-    if is_master_playlist(content):
-        return rewrite_master_playlist(content, url)
-    else:
-        return rewrite_media_playlist(content, url)
+    try:
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        content = res.text
+        if is_master_playlist(content):
+            return rewrite_master_playlist(content, url)
+        else:
+            return rewrite_media_playlist(content, url)
+    except:
+        return "#EXTM3U\n#EXTINF:0,Fetch error"
 
 @app.route('/stream_sub/<path:filename>')
 def stream_sub(filename):
@@ -160,14 +150,14 @@ def stream_sub(filename):
         c = conn.cursor()
         row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
         if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
+            return 'Blocked', 403
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, request.referrer or '')
             c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
             conn.commit()
-            return render_template('sniffer_blocked.html'), 403
+            return 'Blocked', 403
 
-    original_url = f"https://your.cdn.server/path/{filename}"
+    original_url = f"http://localhost:5000/media/{filename}"
     try:
         res = requests.get(original_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         content = res.text
@@ -179,7 +169,7 @@ def stream_sub(filename):
 @app.route('/segment_proxy/<path:name>')
 def segment_proxy(name):
     try:
-        real_segment_url = f"https://your.cdn.server/segments/{name}"
+        real_segment_url = f"http://localhost:5000/media/{name}"
         res = requests.get(real_segment_url, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, timeout=10)
         return Response(stream_with_context(res.iter_content(1024)), content_type=res.headers.get('Content-Type'))
     except Exception as e:
@@ -197,12 +187,12 @@ def playlist():
         c = conn.cursor()
         row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
         if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
+            return 'Blocked', 403
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, ref)
             c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
             conn.commit()
-            return render_template('sniffer_blocked.html'), 403
+            return 'Blocked', 403
 
         row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
         if not row or row[1]:
@@ -224,7 +214,7 @@ def playlist():
     lines = ['#EXTM3U']
     for name, url, logo in channels:
         uid = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
-        proxy = f"https://{request.host}/stream/{uid}?token={token}"
+        proxy = f"http://{request.host}/stream/{uid}?token={token}"
         lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
         lines.append(proxy)
 
@@ -240,12 +230,12 @@ def stream(channel_id):
         c = conn.cursor()
         row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
         if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
+            return 'Blocked', 403
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, request.referrer or '')
             c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
             conn.commit()
-            return render_template('sniffer_blocked.html'), 403
+            return 'Blocked', 403
 
         row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
         if not row or row[1]:
@@ -264,21 +254,6 @@ def stream(channel_id):
                 rewritten = fetch_and_rewrite(url)
                 return Response(rewritten, content_type='application/vnd.apple.mpegurl')
         return abort(404, 'Stream not found')
-
-@app.route('/unlock', methods=['GET', 'POST'])
-def unlock():
-    token = None
-    if request.method == 'POST':
-        token = uuid.uuid4().hex[:12]
-        expiry = (datetime.utcnow() + timedelta(days=30)).isoformat()
-        with sqlite3.connect(DB) as conn:
-            conn.execute('INSERT INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'user'))
-            conn.commit()
-    return render_template('unlock.html', token=token)
-
-@app.route('/not-allowed')
-def not_allowed():
-    return render_template('not_allowed.html')
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
