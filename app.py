@@ -12,7 +12,6 @@ BLOCK_DURATION = 300
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
 ALLOWED_AGENTS = ['ottnavigator', 'test', 'vlc', 'tivimate']
 
-# ---------------- DB INIT ---------------- #
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -23,7 +22,6 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (ip TEXT PRIMARY KEY, unblock_time REAL)''')
 init_db()
 
-# ---------------- HELPERS ---------------- #
 def is_sniffer(ip, ua):
     return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
 
@@ -50,7 +48,6 @@ def validate_token(c, token, ip):
         c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
     return True, "Valid"
 
-# ---------------- AUTH ---------------- #
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -73,7 +70,6 @@ def logout():
     session.pop('admin', None)
     return redirect('/login')
 
-# ---------------- ADMIN ---------------- #
 @app.route('/admin', methods=['GET', 'POST'])
 @login_required
 def admin():
@@ -85,13 +81,11 @@ def admin():
                 days = int(request.form['days'])
                 expiry = (datetime.utcnow() + timedelta(days=days)).isoformat()
                 c.execute('INSERT OR REPLACE INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'admin'))
-
             elif 'add_channel' in request.form:
                 name = request.form['name']
                 stream = request.form['stream']
                 logo = request.form['logo']
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, stream, logo))
-
             elif 'm3u_url' in request.form:
                 try:
                     res = requests.get(request.form['m3u_url'].strip(), headers={'User-Agent': 'Mozilla/5.0'}, timeout=10, verify=False)
@@ -135,7 +129,6 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
-# ---------------- M3U PARSER ---------------- #
 def parse_m3u_lines(lines, c):
     name, logo = None, ''
     for line in lines:
@@ -152,7 +145,6 @@ def parse_m3u_lines(lines, c):
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
                 name, logo = None, ''
 
-# ---------------- PLAYLIST ---------------- #
 @app.route('/iptvplaylist.m3u')
 def playlist():
     token = request.args.get('token', '').strip()
@@ -164,11 +156,10 @@ def playlist():
         c = conn.cursor()
 
         row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
-        if row:
-            if time.time() >= row[0]:
-                c.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
-            else:
-                return render_template('sniffer_blocked.html'), 403
+        if row and time.time() < row[0]:
+            return render_template('sniffer_blocked.html'), 403
+        elif row:
+            c.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
 
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, ref)
@@ -180,8 +171,6 @@ def playlist():
             conn.commit()
             return abort(403, reason)
 
-        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
-                  (datetime.utcnow().isoformat(), ip, token, ua, ref))
         c.execute('SELECT name, stream_url, logo_url FROM channels')
         channels = c.fetchall()
         conn.commit()
@@ -195,7 +184,6 @@ def playlist():
 
     return Response('\n'.join(lines), mimetype='application/x-mpegURL')
 
-# ---------------- STREAM ---------------- #
 @app.route('/stream/<uuid:channel_id>')
 def stream(channel_id):
     token = request.args.get('token', '').strip()
@@ -206,11 +194,10 @@ def stream(channel_id):
         c = conn.cursor()
 
         row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
-        if row:
-            if time.time() >= row[0]:
-                c.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
-            else:
-                return render_template('sniffer_blocked.html'), 403
+        if row and time.time() < row[0]:
+            return render_template('sniffer_blocked.html'), 403
+        elif row:
+            c.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
 
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, request.referrer or '')
@@ -226,13 +213,66 @@ def stream(channel_id):
         for (url,) in c.fetchall():
             if str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip())) == str(channel_id):
                 try:
-                    res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, timeout=10)
-                    return Response(stream_with_context(res.iter_content(1024)), content_type=res.headers.get('Content-Type'))
+                    res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+                    content_type = res.headers.get('Content-Type', '')
+                    if '.m3u8' in url or 'application/vnd.apple.mpegurl' in content_type:
+                        playlist_text = res.text
+                        new_lines = []
+                        for line in playlist_text.splitlines():
+                            if line.strip().endswith('.ts'):
+                                segment = line.strip().split('/')[-1]
+                                proxied = f"https://{request.host}/segment/{channel_id}/{segment}?token={token}"
+                                new_lines.append(proxied)
+                            elif line.strip().startswith('#') or '.m3u8' not in line:
+                                new_lines.append(line)
+                            elif line.strip().endswith('.m3u8'):
+                                nested = line.strip().split('/')[-1]
+                                new_lines.append(f"https://{request.host}/stream/{channel_id}/{nested}?token={token}")
+                            else:
+                                new_lines.append(line)
+                        return Response('\n'.join(new_lines), mimetype='application/x-mpegURL')
+                    return Response(res.content, content_type=content_type)
                 except:
                     return abort(500, 'Error fetching stream')
         return abort(404, 'Stream not found')
 
-# ---------------- TOKEN GENERATOR ---------------- #
+@app.route('/segment/<uuid:channel_id>/<path:segment>')
+def segment_proxy(channel_id, segment):
+    token = request.args.get('token', '').strip()
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent', '').lower()
+
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+
+        row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
+        if row and time.time() < row[0]:
+            return render_template('sniffer_blocked.html'), 403
+        elif row:
+            c.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
+
+        if is_sniffer(ip, ua):
+            log_block(c, ip, token, ua, request.referrer or '')
+            conn.commit()
+            return render_template('sniffer_blocked.html'), 403
+
+        valid, reason = validate_token(c, token, ip)
+        if not valid:
+            conn.commit()
+            return abort(403, reason)
+
+        c.execute('SELECT stream_url FROM channels')
+        for (url,) in c.fetchall():
+            if str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip())) == str(channel_id):
+                try:
+                    base_url = url.rsplit('/', 1)[0]
+                    segment_url = f"{base_url}/{segment}"
+                    res = requests.get(segment_url, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, timeout=10)
+                    return Response(stream_with_context(res.iter_content(1024)), content_type=res.headers.get('Content-Type'))
+                except:
+                    return abort(500, 'Segment fetch error')
+        return abort(404, 'Segment not found')
+
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
