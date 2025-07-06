@@ -62,7 +62,7 @@ def parse_m3u_lines(lines, c):
         if line.startswith('#EXTINF:'):
             parts = line.split(',', 1)
             name = parts[1].strip()
-            logo_part = line.split('tvg-logo="')
+            logo_part = line.split('tvg-logo=\"')
             logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
         elif line.startswith('http'):
             url = line.strip()
