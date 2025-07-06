@@ -10,7 +10,7 @@ MAX_DEVICES = 4
 BLOCK_DURATION = 300
 
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
-ALLOWED_AGENTS = ['ott', 'navigator', 'ott navigator', 'ottnavigator', 'test']
+ALLOWED_AGENTS = ['ottnavigator', 'test']
 
 # ------------------------ DB INIT ------------------------ #
 def init_db():
@@ -43,7 +43,7 @@ init_db()
 
 # ------------------------ HELPERS ------------------------ #
 def is_sniffer(ip, ua):
-    return any(x in ua for x in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
+    return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
 
 def log_block(c, ip, token, ua, ref):
     unblock_time = time.time() + BLOCK_DURATION
@@ -52,14 +52,6 @@ def log_block(c, ip, token, ua, ref):
               (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
 
 # ------------------------ LOGIN ------------------------ #
-def login_required(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        if 'admin' not in session:
-            return redirect('/login')
-        return f(*args, **kwargs)
-    return wrapper
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
@@ -73,6 +65,14 @@ def login():
 def logout():
     session.pop('admin', None)
     return redirect('/login')
+
+def login_required(f):
+    @wraps(f)
+    def wrap(*args, **kwargs):
+        if 'admin' not in session:
+            return redirect('/login')
+        return f(*args, **kwargs)
+    return wrap
 
 # ------------------------ ADMIN PANEL ------------------------ #
 @app.route('/admin', methods=['GET', 'POST'])
@@ -91,22 +91,8 @@ def admin():
                 stream = request.form['stream']
                 logo = request.form['logo']
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, stream, logo))
-            elif 'upload_m3u' in request.form and 'm3ufile' in request.files:
-                m3ufile = request.files['m3ufile']
-                if m3ufile.filename.endswith('.m3u'):
-                    lines = m3ufile.read().decode('utf-8').splitlines()
-                    parse_m3u_lines(lines, c)
-            elif 'm3u_url' in request.form:
-                try:
-                    url = request.form['m3u_url'].strip()
-                    headers = {'User-Agent': 'Mozilla/5.0'}
-                    res = requests.get(url, headers=headers, timeout=10, verify=False)
-                    if res.status_code == 200:
-                        lines = res.text.splitlines()
-                        parse_m3u_lines(lines, c)
-                except Exception as e:
-                    print("[ERROR]", e)
-        conn.commit()
+            conn.commit()
+
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
         token_data = [(t[0], t[1], c.execute('SELECT COUNT(*) FROM token_ips WHERE token=?', (t[0],)).fetchone()[0], t[2], t[3]) for t in tokens]
@@ -124,30 +110,12 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
-# ------------------------ M3U PARSER ------------------------ #
-def parse_m3u_lines(lines, c):
-    name, logo = None, ''
-    for line in lines:
-        if line.startswith('#EXTINF:'):
-            try:
-                parts = line.split(',', 1)
-                name = parts[1].strip()
-                logo_part = line.split('tvg-logo="')
-                logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
-            except:
-                continue
-        elif line.startswith('http'):
-            url = line.strip()
-            if name and url:
-                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
-                name, logo = None, ''
-
-# ------------------------ IPTV PLAYLIST ------------------------ #
+# ------------------------ M3U OUTPUT ------------------------ #
 @app.route('/iptvplaylist.m3u')
 def playlist():
     token = request.args.get('token', '').strip()
     ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').strip().lower()
+    ua = request.headers.get('User-Agent', '').lower()
     ref = request.referrer or ''
 
     with sqlite3.connect(DB) as conn:
@@ -171,24 +139,25 @@ def playlist():
                 return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
-        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)', (datetime.utcnow().isoformat(), ip, token, ua, ref))
-        channels = c.execute('SELECT name, stream_url, logo_url FROM channels').fetchall()
+        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                  (datetime.utcnow().isoformat(), ip, token, ua, ref))
+        c.execute('SELECT name, stream_url, logo_url FROM channels')
+        channels = c.fetchall()
         conn.commit()
 
     lines = ['#EXTM3U']
     for name, url, logo in channels:
-        uid = str(uuid.uuid5(uuid.NAMESPACE_URL, url))
-        proxy = f'https://{request.host}/stream?token={token}&channelid={uid}'
-        lines.append(f'#EXTINF:-1 tvg-logo="{logo}",{name}')
-        lines.append(proxy)
+        uid = str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip()))
+        proxy_url = f'https://{request.host}/stream/{uid}?token={token}'
+        lines.append(f'#EXTINF:-1 tvg-logo=\"{logo}\",{name}')
+        lines.append(proxy_url)
 
     return Response('\n'.join(lines), mimetype='application/x-mpegURL')
 
-# ------------------------ STREAM PROXY (Secure) ------------------------ #
-@app.route('/stream')
-def stream():
+# ------------------------ STREAM PROXY ------------------------ #
+@app.route('/stream/<uuid:stream_id>')
+def stream(stream_id):
     token = request.args.get('token', '').strip()
-    channelid = request.args.get('channelid', '').strip()
     ip = request.remote_addr
     ua = request.headers.get('User-Agent', '').lower()
 
@@ -215,13 +184,12 @@ def stream():
 
         c.execute('SELECT stream_url FROM channels')
         for (url,) in c.fetchall():
-            if str(uuid.uuid5(uuid.NAMESPACE_URL, url)) == channelid:
+            if str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip())) == str(stream_id):
                 try:
-                    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=10)
-                    return Response(stream_with_context(r.iter_content(chunk_size=1024)),
-                                    content_type=r.headers.get('Content-Type', 'application/vnd.apple.mpegurl'))
+                    r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, timeout=15)
+                    return Response(stream_with_context(r.iter_content(1024)), content_type=r.headers.get('Content-Type', 'application/octet-stream'))
                 except Exception as e:
-                    return abort(500, f"Proxy error: {e}")
+                    return abort(502, f'Failed to fetch stream: {e}')
         return abort(404, 'Stream not found')
 
 # ------------------------ TOKEN UNLOCK ------------------------ #
