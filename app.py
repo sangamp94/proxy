@@ -13,7 +13,7 @@ BLOCK_DURATION = 300  # seconds
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
 ALLOWED_AGENTS = ['ottnavigator', 'test']
 
-# ------------------------ DB INIT ------------------------ #
+# ------------------------ HELPER FUNCTIONS ------------------------ #
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -23,9 +23,7 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, stream_url TEXT, logo_url TEXT, original_url TEXT, is_restreamed INTEGER DEFAULT 0)''')
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (ip TEXT PRIMARY KEY, unblock_time REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS restream_processes (channel_id INTEGER PRIMARY KEY, pid INTEGER)''')
-init_db()
 
-# ------------------------ LOGIN SYSTEM ------------------------ #
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -34,21 +32,32 @@ def login_required(f):
         return f(*args, **kwargs)
     return wrapper
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        if request.form['username'] == 'admin' and request.form['password'] == 'admin':
-            session['admin'] = True
-            return redirect('/admin')
-        return 'Invalid credentials'
-    return render_template('login.html')
+def is_sniffer(ip, ua):
+    return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
 
-@app.route('/logout')
-def logout():
-    session.pop('admin', None)
-    return redirect('/login')
+def log_block(c, ip, token, ua, ref):
+    unblock_time = time.time() + BLOCK_DURATION
+    c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
+    c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
+              (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
 
-# ------------------------ RESTREAM FUNCTIONS ------------------------ #
+def parse_m3u_lines(lines, c):
+    name, logo = None, ''
+    for line in lines:
+        if line.startswith('#EXTINF:'):
+            try:
+                parts = line.split(',', 1)
+                name = parts[1].strip()
+                logo_part = line.split('tvg-logo="')
+                logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
+            except:
+                continue
+        elif line.startswith('http'):
+            url = line.strip()
+            if name and url:
+                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
+                name, logo = None, ''
+
 def start_restream(channel_id, original_url, restream_url):
     try:
         with sqlite3.connect(DB) as conn:
@@ -99,7 +108,21 @@ def stop_restream(channel_id):
     except Exception as e:
         print(f"Error stopping restream for channel {channel_id}: {e}")
 
-# ------------------------ ADMIN PANEL ------------------------ #
+# ------------------------ ROUTES ------------------------ #
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        if request.form['username'] == 'admin' and request.form['password'] == 'admin':
+            session['admin'] = True
+            return redirect('/admin')
+        return 'Invalid credentials'
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.pop('admin', None)
+    return redirect('/login')
+
 @app.route('/admin', methods=['GET', 'POST'])
 @login_required
 def admin():
@@ -171,35 +194,6 @@ def stop_restream_channel(channel_id):
     stop_restream(channel_id)
     return redirect('/admin')
 
-# ------------------------ M3U PARSER ------------------------ #
-def parse_m3u_lines(lines, c):
-    name, logo = None, ''
-    for line in lines:
-        if line.startswith('#EXTINF:'):
-            try:
-                parts = line.split(',', 1)
-                name = parts[1].strip()
-                logo_part = line.split('tvg-logo="')
-                logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
-            except:
-                continue
-        elif line.startswith('http'):
-            url = line.strip()
-            if name and url:
-                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
-                name, logo = None, ''
-
-# ------------------------ SNIFFER CHECK ------------------------ #
-def is_sniffer(ip, ua):
-    return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
-
-def log_block(c, ip, token, ua, ref):
-    unblock_time = time.time() + BLOCK_DURATION
-    c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
-    c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
-              (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
-
-# ------------------------ IPTV PLAYLIST ------------------------ #
 @app.route('/iptvplaylist.m3u')
 def playlist():
     token = request.args.get('token', '').strip()
@@ -243,7 +237,6 @@ def playlist():
 
     return Response('\n'.join(lines), mimetype='application/x-mpegURL')
 
-# ------------------------ STREAM PROXY ------------------------ #
 @app.route('/stream/<uuid:channel_id>')
 def stream(channel_id):
     token = request.args.get('token', '').strip()
@@ -298,7 +291,6 @@ def serve_restream(channel_id):
         except Exception as e:
             return abort(502, f'Restream proxy error: {str(e)}')
 
-# ------------------------ TOKEN GENERATOR ------------------------ #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
@@ -313,6 +305,9 @@ def unlock():
 @app.route('/not-allowed')
 def not_allowed():
     return render_template('not_allowed.html')
+
+# ------------------------ INITIALIZATION ------------------------ #
+init_db()
 
 if __name__ == '__main__':
     with sqlite3.connect(DB) as conn:
