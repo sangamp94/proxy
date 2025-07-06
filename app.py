@@ -23,6 +23,33 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (ip TEXT PRIMARY KEY, unblock_time REAL)''')
 init_db()
 
+# ------------------------ HELPERS ------------------------ #
+def is_sniffer(ip, ua):
+    return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
+
+def log_block(c, ip, token, ua, ref):
+    unblock_time = time.time() + BLOCK_DURATION
+    c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
+    c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
+              (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
+
+def validate_token(c, token, ip):
+    row = c.execute("SELECT expiry, banned FROM tokens WHERE token = ?", (token,)).fetchone()
+    if not row:
+        return False, "Token not found"
+    expiry, banned = row
+    if banned:
+        return False, "Token banned"
+    if datetime.fromisoformat(expiry) < datetime.utcnow():
+        return False, "Token expired"
+    if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
+        count = c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0]
+        if count >= MAX_DEVICES:
+            c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+            return False, "Device limit exceeded"
+        c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+    return True, "Valid"
+
 # ------------------------ LOGIN SYSTEM ------------------------ #
 def login_required(f):
     @wraps(f)
@@ -71,11 +98,9 @@ def admin():
                     headers = {'User-Agent': 'Mozilla/5.0'}
                     res = requests.get(m3u_url, headers=headers, timeout=10, verify=False)
                     if res.status_code == 200:
-                        lines = res.text.splitlines()
-                        parse_m3u_lines(lines, c)
+                        parse_m3u_lines(res.text.splitlines(), c)
                 except Exception as e:
                     print(f"[ERROR] M3U fetch failed: {e}")
-
             conn.commit()
 
         c.execute('SELECT * FROM tokens')
@@ -113,16 +138,6 @@ def parse_m3u_lines(lines, c):
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
                 name, logo = None, ''
 
-# ------------------------ SNIFFER CHECK ------------------------ #
-def is_sniffer(ip, ua):
-    return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
-
-def log_block(c, ip, token, ua, ref):
-    unblock_time = time.time() + BLOCK_DURATION
-    c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
-    c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
-              (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
-
 # ------------------------ IPTV PLAYLIST ------------------------ #
 @app.route('/iptvplaylist.m3u')
 def playlist():
@@ -133,24 +148,24 @@ def playlist():
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
+
         row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
-        if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
+        if row:
+            if time.time() >= row[0]:
+                c.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
+            else:
+                return render_template('sniffer_blocked.html'), 403
+
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, ref)
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
 
-        row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
-        if not row or row[1]:
-            return abort(403, 'Invalid or banned token')
-
-        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
-            if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
-                c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
-                conn.commit()
-                return abort(403, 'Device limit exceeded')
-            c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+        valid, reason = validate_token(c, token, ip)
+        if not valid:
+            print(f"[403] {reason} for token={token} ip={ip}")
+            conn.commit()
+            return abort(403, reason)
 
         c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
                   (datetime.utcnow().isoformat(), ip, token, ua, ref))
@@ -176,24 +191,23 @@ def stream(channel_id):
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
+
         row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
-        if row and time.time() < row[0]:
-            return render_template('sniffer_blocked.html'), 403
+        if row:
+            if time.time() >= row[0]:
+                c.execute("DELETE FROM blocked_ips WHERE ip = ?", (ip,))
+            else:
+                return render_template('sniffer_blocked.html'), 403
+
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, request.referrer or '')
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
 
-        row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
-        if not row or row[1]:
-            return abort(403, 'Invalid or banned token')
-
-        if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
-            if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
-                c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
-                conn.commit()
-                return abort(403, 'Device limit exceeded')
-            c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+        valid, reason = validate_token(c, token, ip)
+        if not valid:
+            conn.commit()
+            return abort(403, reason)
 
         c.execute('SELECT stream_url FROM channels')
         for (url,) in c.fetchall():
@@ -205,7 +219,7 @@ def stream(channel_id):
                     return abort(500, 'Error fetching stream')
         return abort(404, 'Stream not found')
 
-# ------------------------ TOKEN GENERATOR ------------------------ #
+# ------------------------ TOKEN UNLOCK ------------------------ #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
