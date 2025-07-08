@@ -1,4 +1,4 @@
-from flask import Flask, request, redirect, render_template, session, abort, Response
+from flask import Flask, request, redirect, render_template, session, abort, Response, stream_with_context
 from functools import wraps
 from datetime import datetime, timedelta
 import sqlite3, os, uuid, requests, time
@@ -212,8 +212,57 @@ def stream():
         c.execute('SELECT name, stream_url FROM channels')
         for name, url in c.fetchall():
             if str(uuid.uuid5(uuid.NAMESPACE_URL, url)) == channelid:
-                return redirect(url)
+                try:
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    r = requests.get(url, headers=headers, timeout=10)
+                    r.raise_for_status()
+                    base_url = url.rsplit('/', 1)[0]
+                    rewritten = []
+                    for line in r.text.splitlines():
+                        if line.strip().startswith("#"):
+                            rewritten.append(line)
+                        elif line.strip().endswith(('.m3u8', '.ts', '.mpd', '.m4s')):
+                            seg_url = line.strip()
+                            if not seg_url.startswith("http"):
+                                seg_url = f"{base_url}/{seg_url}"
+                            proxy_url = f"/segment?token={token}&channelid={channelid}&url={seg_url}"
+                            rewritten.append(proxy_url)
+                        else:
+                            rewritten.append(line)
+                    return Response('\n'.join(rewritten), mimetype='application/vnd.apple.mpegurl')
+                except Exception as e:
+                    print("[Proxy Error]", e)
+                    return abort(500, 'Failed to load stream')
         return abort(404, 'Stream not found')
+
+# ------------------------ SEGMENT PROXY ------------------------ #
+@app.route('/segment')
+def segment():
+    token = request.args.get('token')
+    channelid = request.args.get('channelid')
+    segment_url = request.args.get('url')
+
+    if not all([token, channelid, segment_url]):
+        return abort(400)
+
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    try:
+        resp = requests.get(segment_url, headers=headers, stream=True, timeout=10)
+        content_type = resp.headers.get('Content-Type', 'application/octet-stream')
+
+        # Override content-type if URL hints DASH
+        if segment_url.endswith('.mpd'):
+            content_type = 'application/dash+xml'
+        elif segment_url.endswith('.m4s'):
+            content_type = 'video/iso.segment'
+
+        return Response(
+            stream_with_context(resp.iter_content(chunk_size=4096)),
+            content_type=content_type
+        )
+    except Exception as e:
+        print("[SEGMENT ERROR]", e)
+        return abort(500)
 
 # ------------------------ UNLOCK PAGE ------------------------ #
 @app.route('/unlock', methods=['GET', 'POST'])
