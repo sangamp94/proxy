@@ -229,14 +229,23 @@ async def segment():
     if not url:
         return abort(400)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers={'User-Agent': 'Mozilla'}) as res:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers={'User-Agent': 'Mozilla', 'Connection': 'keep-alive'}) as res:
                 ctype = res.headers.get('Content-Type', 'application/octet-stream')
                 if url.endswith('.mpd'):
                     ctype = 'application/dash+xml'
                 elif url.endswith('.m4s'):
                     ctype = 'video/iso.segment'
-                return Response(res.content.iter_chunked(4096), content_type=ctype)
+
+                async def stream():
+                    try:
+                        async for chunk in res.content.iter_chunked(4096):
+                            yield chunk
+                    except Exception as e:
+                        print("[Segment Streaming Error]", e)
+
+                return Response(stream(), content_type=ctype)
     except Exception as e:
         print('[Segment Proxy Error]', e)
         return abort(500)
