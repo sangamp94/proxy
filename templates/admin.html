@@ -142,6 +142,13 @@
       </table>
     </div>
 
+    <!-- Delete All Channels -->
+    <form action="/admin/delete_all_channels" method="POST" onsubmit="return confirm('Are you sure you want to delete ALL channels?');" class="mb-3 text-end">
+      <button type="submit" class="btn btn-danger">
+        🗑️ Delete All Channels
+      </button>
+    </form>
+
     <!-- Channel Table -->
     <h4>Channels</h4>
     <div class="table-responsive mb-4">
