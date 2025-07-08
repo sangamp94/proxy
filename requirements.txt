@@ -1,4 +1,3 @@
-Flask
-gunicorn
-cryptography
-requests
+quart
+uvicorn
+aiohttp
