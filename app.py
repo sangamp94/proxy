@@ -12,23 +12,16 @@ BLOCK_DURATION = 300
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
 ALLOWED_AGENTS = ['ott', 'navigator', 'ott navigator', 'ottnavigator', 'tivimate', 'linux', 'android', 'test']
 
-# ---------------- INIT DB ---------------- #
 def init_db():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS tokens (
-            token TEXT PRIMARY KEY, expiry TEXT, banned INTEGER DEFAULT 0, created_by TEXT DEFAULT 'admin')''')
-        c.execute('''CREATE TABLE IF NOT EXISTS token_ips (
-            token TEXT, ip TEXT, UNIQUE(token, ip))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS logs (
-            timestamp TEXT, ip TEXT, token TEXT, user_agent TEXT, referrer TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, stream_url TEXT, logo_url TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (
-            ip TEXT PRIMARY KEY, unblock_time REAL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, expiry TEXT, banned INTEGER DEFAULT 0, created_by TEXT DEFAULT 'admin')''')
+        c.execute('''CREATE TABLE IF NOT EXISTS token_ips (token TEXT, ip TEXT, UNIQUE(token, ip))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS logs (timestamp TEXT, ip TEXT, token TEXT, user_agent TEXT, referrer TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, stream_url TEXT, logo_url TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (ip TEXT PRIMARY KEY, unblock_time REAL)''')
 init_db()
 
-# ---------------- AUTH ---------------- #
 def login_required(f):
     @wraps(f)
     def wrap(*args, **kwargs):
@@ -51,7 +44,6 @@ def logout():
     session.pop('admin', None)
     return redirect('/login')
 
-# ---------------- ADMIN PANEL ---------------- #
 @app.route('/admin', methods=['GET', 'POST'])
 @login_required
 def admin():
@@ -78,6 +70,8 @@ def admin():
                         parse_m3u_lines(res.text.splitlines(), c)
                 except Exception as e:
                     print('[M3U URL ERROR]', e)
+            elif 'delete_all_channels' in request.form:
+                c.execute('DELETE FROM channels')
         conn.commit()
         c.execute('SELECT * FROM tokens')
         tokens = c.fetchall()
@@ -94,15 +88,6 @@ def delete_channel(id):
         conn.commit()
     return redirect('/admin')
 
-@app.route('/admin/delete_all_channels', methods=['POST'])
-@login_required
-def delete_all_channels():
-    with sqlite3.connect(DB) as conn:
-        conn.execute('DELETE FROM channels')
-        conn.commit()
-    return redirect('/admin')
-
-# ---------------- PARSER ---------------- #
 def parse_m3u_lines(lines, c):
     name, logo = None, ''
     for line in lines:
@@ -120,7 +105,6 @@ def parse_m3u_lines(lines, c):
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
                 name, logo = None, ''
 
-# ---------------- SECURITY ---------------- #
 def is_sniffer(ip, ua):
     ua = ua.lower()
     return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
@@ -130,7 +114,6 @@ def log_block(c, ip, token, ua, ref):
     c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
               (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
 
-# ---------------- PLAYLIST ---------------- #
 @app.route('/iptvplaylist.m3u')
 def playlist():
     token = request.args.get('token', '').strip()
@@ -152,7 +135,7 @@ def playlist():
         if not c.execute('SELECT 1 FROM token_ips WHERE token=? AND ip=?', (token, ip)).fetchone():
             if c.execute('SELECT COUNT(*) FROM token_ips WHERE token=?', (token,)).fetchone()[0] >= MAX_DEVICES:
                 c.execute('UPDATE tokens SET banned = 1 WHERE token=?', (token,))
-                return abort(403, 'Max devices reached')
+                return abort(403)
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
         c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
                   (datetime.utcnow().isoformat(), ip, token, ua, ref))
@@ -168,7 +151,6 @@ def playlist():
 
     return Response('\n'.join(lines), mimetype='application/x-mpegURL')
 
-# ---------------- STREAM ---------------- #
 @app.route('/stream')
 def stream():
     token = request.args.get('token')
@@ -201,9 +183,14 @@ def stream():
                     r.raise_for_status()
                     output = []
                     for line in r.text.splitlines():
+                        if not isinstance(line, str):
+                            continue
+                        line = line.strip()
+                        if not line:
+                            continue
                         if line.startswith('#'):
                             output.append(line)
-                        elif line.strip().endswith(('.m3u8', '.ts', '.mpd', '.m4s')):
+                        elif line.endswith(('.m3u8', '.ts', '.mpd', '.m4s')):
                             full_url = f'{base_url}/{line}' if not line.startswith('http') else line
                             proxy = f'/segment?token={token}&channelid={channelid}&url={full_url}'
                             output.append(proxy)
@@ -215,7 +202,6 @@ def stream():
                     return abort(500)
         return abort(404)
 
-# ---------------- SEGMENT ---------------- #
 @app.route('/segment')
 def segment():
     url = request.args.get('url')
@@ -233,7 +219,6 @@ def segment():
         print('[Segment Proxy Error]', e)
         return abort(500)
 
-# ---------------- UNLOCK ---------------- #
 @app.route('/unlock', methods=['GET', 'POST'])
 def unlock():
     token = None
