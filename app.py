@@ -10,7 +10,7 @@ MAX_DEVICES = 4
 BLOCK_DURATION = 300  # seconds
 
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
-ALLOWED_AGENTS = ['ott', 'navigator', 'ott navigator', 'ottnavigator', 'test']
+ALLOWED_AGENTS = ['ott', 'navigator', 'ott navigator', 'ottnavigator', 'test', 'TiviMate/5.1.6']
 
 # ------------------------ DB INIT ------------------------ #
 def init_db():
