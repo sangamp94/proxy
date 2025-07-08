@@ -1,4 +1,3 @@
-# FULL IPTV APP WITH TOKEN, DEVICE LIMIT, SNIFFER DETECTION, HLS+DASH PROXY
 from flask import Flask, request, redirect, render_template, session, abort, Response, stream_with_context
 from functools import wraps
 from datetime import datetime, timedelta
@@ -92,6 +91,14 @@ def admin():
 def delete_channel(id):
     with sqlite3.connect(DB) as conn:
         conn.execute('DELETE FROM channels WHERE id = ?', (id,))
+        conn.commit()
+    return redirect('/admin')
+
+@app.route('/admin/delete_all_channels', methods=['POST'])
+@login_required
+def delete_all_channels():
+    with sqlite3.connect(DB) as conn:
+        conn.execute('DELETE FROM channels')
         conn.commit()
     return redirect('/admin')
 
