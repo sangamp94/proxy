@@ -7,10 +7,8 @@ app = Flask(__name__)
 app.secret_key = 'supersecretkey'
 DB = 'database.db'
 MAX_DEVICES = 4
-BLOCK_DURATION = 300  # 5 minutes
 
-SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
-ALLOWED_AGENTS = ['ott', 'Tivimate', 'ott navigator', 'ottnavigator', 'test']
+# SNIFFER and ALLOWED_AGENTS lists have been removed.
 
 # ------------------------ INIT DB ------------------------ #
 def init_db():
@@ -36,9 +34,7 @@ def init_db():
             name TEXT,
             stream_url TEXT,
             logo_url TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS blocked_ips (
-            ip TEXT PRIMARY KEY,
-            unblock_time REAL)''')
+        # The 'blocked_ips' table and related logic have been removed.
 init_db()
 
 # ------------------------ AUTH ------------------------ #
@@ -96,7 +92,7 @@ def admin():
                     if res.status_code == 200:
                         parse_m3u_lines(res.text.splitlines(), c)
                 except Exception as e:
-                    print("M3U Fetch Error:", e)
+                    print("M3U Fetch Error:", e) # Log the error for debugging
 
         conn.commit()
         c.execute('SELECT * FROM tokens')
@@ -156,25 +152,18 @@ def parse_m3u_lines(lines, c):
                 name = parts[1].strip()
                 logo_part = line.split('tvg-logo="')
                 logo = logo_part[1].split('"')[0] if len(logo_part) > 1 else ''
-            except:
+            except IndexError: # Handle cases where split might fail
+                name = None # Reset name to skip this line if parsing fails
+                logo = ''
                 continue
         elif line.startswith('http'):
             url = line.strip()
             if name and url:
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
-                name, logo = None, ''
+                name, logo = None, '' # Reset for next channel
 
-# ------------------------ SECURITY ------------------------ #
-def is_sniffer(ip, ua):
-    if any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS):
-        return True
-    return False
-
-def log_block(c, ip, token, ua, ref):
-    unblock_time = time.time() + BLOCK_DURATION
-    c.execute("INSERT OR REPLACE INTO blocked_ips(ip, unblock_time) VALUES (?, ?)", (ip, unblock_time))
-    c.execute("INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)",
-              (datetime.utcnow().isoformat(), ip, token or 'unknown', ua, ref))
+# ------------------------ SECURITY (Sniffer related removed) ------------------------ #
+# The 'is_sniffer' and 'log_block' functions have been removed.
 
 # ------------------------ M3U PLAYLIST ------------------------ #
 @app.route('/iptvplaylist.m3u')
@@ -186,14 +175,8 @@ def playlist():
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        blocked_ip_row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
-        if blocked_ip_row and time.time() < blocked_ip_row[0]:
-            return render_template('sniffer_blocked.html'), 403
 
-        if is_sniffer(ip, ua):
-            log_block(c, ip, token, ua, ref)
-            conn.commit()
-            return render_template('sniffer_blocked.html'), 403
+        # Sniffer and blocked IP checks have been completely removed.
 
         row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
         if not row or row[1]: # Token not found or is banned
@@ -221,7 +204,10 @@ def playlist():
                 return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
-        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)', (datetime.utcnow().isoformat(), ip, token, ua, ref))
+        # Log this successful playlist access
+        c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                  (datetime.utcnow().isoformat(), ip, token, ua, ref))
+        
         channels = c.execute('SELECT name, stream_url, logo_url FROM channels').fetchall()
         conn.commit()
 
@@ -245,14 +231,8 @@ def stream():
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        blocked_ip_row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
-        if blocked_ip_row and time.time() < blocked_ip_row[0]:
-            return render_template('sniffer_blocked.html'), 403
 
-        if is_sniffer(ip, ua):
-            log_block(c, ip, token, ua, ref)
-            conn.commit()
-            return render_template('sniffer_blocked.html'), 403
+        # Sniffer and blocked IP checks have been completely removed.
 
         row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
         if not row or row[1]: # Token not found or is banned
@@ -280,7 +260,7 @@ def stream():
                 return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
-        # Log stream access (optional, can be verbose)
+        # Log stream access (optional, uncomment if you want very verbose logging for every stream segment)
         # c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
         #           (datetime.utcnow().isoformat(), ip, token + ' (stream)', ua, ref))
 
@@ -288,7 +268,7 @@ def stream():
             if str(uuid.uuid5(uuid.NAMESPACE_URL, url)) == channelid:
                 conn.commit() # Commit any pending changes before redirect
                 return redirect(url)
-        conn.commit() # Commit if no channel found
+        conn.commit() # Commit if no channel found before aborting
         return abort(404, 'Stream not found')
 
 # ------------------------ USER UNLOCK PAGE ------------------------ #
@@ -305,7 +285,11 @@ def unlock():
 
 @app.route('/not-allowed')
 def not_allowed():
+    # This route and its template ('not_allowed.html') were likely used for sniffer blocking.
+    # Since sniffer blocking is removed, this page might no longer serve a direct purpose
+    # in the current logic. You might consider removing it if it's completely unneeded.
     return render_template('not_allowed.html')
 
 if __name__ == '__main__':
+    # Ensure debug is False in production
     app.run(debug=True, port=5000)
