@@ -8,7 +8,11 @@ app.secret_key = 'supersecretkey'
 DB = 'database.db'
 MAX_DEVICES = 4
 
-# SNIFFER and ALLOWED_AGENTS lists have been removed.
+# Reintroduced and refined ALLOWED_AGENTS
+# These are case-insensitive checks, so convert incoming User-Agent to lowercase.
+# 'ott' covers 'ott navigator' and 'ottnavigator' and generic 'ott' clients.
+ALLOWED_AGENTS = ['ott', 'tivimate']
+# You might want to add other known legitimate IPTV player user agents here if needed.
 
 # ------------------------ INIT DB ------------------------ #
 def init_db():
@@ -34,7 +38,6 @@ def init_db():
             name TEXT,
             stream_url TEXT,
             logo_url TEXT)''')
-        # The 'blocked_ips' table and related logic have been removed.
 init_db()
 
 # ------------------------ AUTH ------------------------ #
@@ -162,8 +165,16 @@ def parse_m3u_lines(lines, c):
                 c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, url, logo))
                 name, logo = None, '' # Reset for next channel
 
-# ------------------------ SECURITY (Sniffer related removed) ------------------------ #
-# The 'is_sniffer' and 'log_block' functions have been removed.
+# ------------------------ USER-AGENT FILTERING ------------------------ #
+def is_allowed_user_agent(user_agent):
+    """
+    Checks if the given user_agent string contains any of the allowed agent substrings.
+    """
+    ua_lower = user_agent.lower()
+    for agent in ALLOWED_AGENTS:
+        if agent in ua_lower:
+            return True
+    return False
 
 # ------------------------ M3U PLAYLIST ------------------------ #
 @app.route('/iptvplaylist.m3u')
@@ -176,7 +187,12 @@ def playlist():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
 
-        # Sniffer and blocked IP checks have been completely removed.
+        # User-Agent filtering: Ban if not OTT Navigator or TiviMate
+        if not is_allowed_user_agent(ua):
+            c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                      (datetime.utcnow().isoformat(), ip, token or 'unknown', ua + ' (UA_BANNED)', ref))
+            conn.commit()
+            return abort(403, 'Access denied: Unsupported client application.')
 
         row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
         if not row or row[1]: # Token not found or is banned
@@ -232,7 +248,12 @@ def stream():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
 
-        # Sniffer and blocked IP checks have been completely removed.
+        # User-Agent filtering: Ban if not OTT Navigator or TiviMate
+        if not is_allowed_user_agent(ua):
+            c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                      (datetime.utcnow().isoformat(), ip, token or 'unknown', ua + ' (UA_BANNED)', ref))
+            conn.commit()
+            return abort(403, 'Access denied: Unsupported client application.')
 
         row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
         if not row or row[1]: # Token not found or is banned
@@ -285,9 +306,7 @@ def unlock():
 
 @app.route('/not-allowed')
 def not_allowed():
-    # This route and its template ('not_allowed.html') were likely used for sniffer blocking.
-    # Since sniffer blocking is removed, this page might no longer serve a direct purpose
-    # in the current logic. You might consider removing it if it's completely unneeded.
+    # This page now serves as a generic "Access Denied" page for unsupported User-Agents.
     return render_template('not_allowed.html')
 
 if __name__ == '__main__':
