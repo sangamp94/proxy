@@ -8,7 +8,7 @@ app.secret_key = 'supersecretkey'
 DB = 'database.db'
 MAX_DEVICES = 4
 
-ALLOWED_AGENTS = ['ott', 'tivimate']
+ALLOWED_AGENTS = ['ott', 'tivimate','playtv']
 
 # ------------------------ INIT DB ------------------------ #
 def init_db():
