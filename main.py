@@ -10,7 +10,7 @@ MAX_DEVICES = 4
 BLOCK_DURATION = 300  # seconds
 
 SNIFFERS = ['httpcanary', 'fiddler', 'charles', 'mitm', 'wireshark', 'packet', 'debugproxy', 'curl', 'python', 'wget', 'postman', 'reqable']
-ALLOWED_AGENTS = ['ottnavigator', 'test']
+ALLOWED_AGENTS = ['ottnavigator', 'test', 'Tivimate']
 
 # ------------------------ DB INIT ------------------------ #
 def init_db():
@@ -53,58 +53,48 @@ def admin():
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
         if request.method == 'POST':
-            if 'add_token' in request.form:
-                token = request.form['token'].strip()
-                days = int(request.form['days'])
+            form = request.form
+
+            if 'add_token' in form:
+                token = form['token'].strip()
+                days = int(form['days'])
                 expiry = (datetime.utcnow() + timedelta(days=days)).isoformat()
                 c.execute('INSERT OR REPLACE INTO tokens(token, expiry, created_by) VALUES (?, ?, ?)', (token, expiry, 'admin'))
 
-            elif 'add_channel' in request.form:
-                name = request.form['name']
-                stream = request.form['stream']
-                logo = request.form['logo']
-                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (name, stream, logo))
+            elif 'add_channel' in form:
+                c.execute('INSERT INTO channels(name, stream_url, logo_url) VALUES (?, ?, ?)', (
+                    form['name'], form['stream'], form['logo']
+                ))
 
-            elif 'm3u_url' in request.form:
-                m3u_url = request.form['m3u_url'].strip()
+            elif 'm3u_url' in form:
                 try:
-                    headers = {'User-Agent': 'Mozilla/5.0'}
-                    res = requests.get(m3u_url, headers=headers, timeout=10, verify=False)
+                    res = requests.get(form['m3u_url'].strip(), headers={'User-Agent': 'Mozilla/5.0'}, timeout=10, verify=False)
                     if res.status_code == 200:
-                        lines = res.text.splitlines()
-                        parse_m3u_lines(lines, c)
+                        parse_m3u_lines(res.text.splitlines(), c)
                 except Exception as e:
                     print(f"[ERROR] M3U fetch failed: {e}")
 
-            elif 'delete_token' in request.form:
-                token = request.form['delete_token']
-                c.execute('DELETE FROM tokens WHERE token = ?', (token,))
-                c.execute('DELETE FROM token_ips WHERE token = ?', (token,))
+            elif 'delete_token' in form:
+                c.execute('DELETE FROM tokens WHERE token = ?', (form['delete_token'],))
 
-            elif 'unban_ip' in request.form:
-                ip = request.form['unban_ip']
-                c.execute('DELETE FROM blocked_ips WHERE ip = ?', (ip,))
+            elif 'unban_token' in form:
+                c.execute('UPDATE tokens SET banned = 0 WHERE token = ?', (form['unban_token'],))
 
-            elif 'unban_token' in request.form:
-                token = request.form['unban_token']
-                c.execute('UPDATE tokens SET banned = 0 WHERE token = ?', (token,))
+            elif 'renew_token' in form:
+                expiry = (datetime.utcnow() + timedelta(days=int(form['renew_days']))).isoformat()
+                c.execute('UPDATE tokens SET expiry = ? WHERE token = ?', (expiry, form['renew_token']))
 
-            elif 'renew_token' in request.form:
-                token = request.form['renew_token']
-                days = int(request.form.get('renew_days', 30))
-                expiry = (datetime.utcnow() + timedelta(days=days)).isoformat()
-                c.execute('UPDATE tokens SET expiry = ? WHERE token = ?', (expiry, token))
+            elif 'unban_ip' in form:
+                c.execute('DELETE FROM blocked_ips WHERE ip = ?', (form['unban_ip'],))
 
             conn.commit()
 
-        c.execute('SELECT * FROM tokens')
-        tokens = c.fetchall()
+        tokens = c.execute('SELECT * FROM tokens').fetchall()
         token_data = [(t[0], t[1], c.execute('SELECT COUNT(*) FROM token_ips WHERE token=?', (t[0],)).fetchone()[0], t[2], t[3]) for t in tokens]
-        c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100')
-        logs = c.fetchall()
-        c.execute('SELECT * FROM channels')
-        channels = c.fetchall()
-        return render_template('admin.html', tokens=token_data, logs=logs, channels=channels, max_devices=MAX_DEVICES)
+        logs = c.execute('SELECT * FROM logs ORDER BY timestamp DESC LIMIT 100').fetchall()
+        channels = c.execute('SELECT * FROM channels').fetchall()
+        blocked = c.execute('SELECT ip FROM blocked_ips').fetchall()
+        return render_template('admin.html', tokens=token_data, logs=logs, channels=channels, blocked=blocked)
 
 @app.route('/admin/delete_channel/<int:id>')
 @login_required
@@ -134,7 +124,8 @@ def parse_m3u_lines(lines, c):
 
 # ------------------------ SNIFFER CHECK ------------------------ #
 def is_sniffer(ip, ua):
-    return any(s in ua for s in SNIFFERS) or not any(agent in ua for agent in ALLOWED_AGENTS)
+    ua_clean = ua.lower().replace(" ", "")
+    return any(s in ua_clean for s in SNIFFERS) or not any(agent in ua_clean for agent in ALLOWED_AGENTS)
 
 def log_block(c, ip, token, ua, ref):
     unblock_time = time.time() + BLOCK_DURATION
@@ -147,7 +138,7 @@ def log_block(c, ip, token, ua, ref):
 def playlist():
     token = request.args.get('token', '').strip()
     ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').lower()
+    ua = request.headers.get('User-Agent', '')
     ref = request.referrer or ''
 
     with sqlite3.connect(DB) as conn:
@@ -173,8 +164,7 @@ def playlist():
 
         c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
                   (datetime.utcnow().isoformat(), ip, token, ua, ref))
-        c.execute('SELECT name, stream_url, logo_url FROM channels')
-        channels = c.fetchall()
+        channels = c.execute('SELECT name, stream_url, logo_url FROM channels').fetchall()
         conn.commit()
 
     lines = ['#EXTM3U']
@@ -191,7 +181,7 @@ def playlist():
 def stream(channel_id):
     token = request.args.get('token', '').strip()
     ip = request.remote_addr
-    ua = request.headers.get('User-Agent', '').lower()
+    ua = request.headers.get('User-Agent', '')
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
@@ -214,8 +204,8 @@ def stream(channel_id):
                 return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
 
-        c.execute('SELECT stream_url FROM channels')
-        for (url,) in c.fetchall():
+        channels = c.execute('SELECT stream_url FROM channels').fetchall()
+        for (url,) in channels:
             if str(uuid.uuid5(uuid.NAMESPACE_URL, url.strip())) == str(channel_id):
                 try:
                     res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, timeout=10)
