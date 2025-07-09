@@ -124,6 +124,28 @@ def delete_all_channels():
         conn.commit()
     return redirect('/admin')
 
+# ------------------------ ADMIN ACTIONS FOR TOKENS ------------------------ #
+@app.route('/admin/action/<token>/<action>')
+@login_required
+def token_action(token, action):
+    with sqlite3.connect(DB) as conn:
+        c = conn.cursor()
+        if action == 'delete':
+            c.execute('DELETE FROM tokens WHERE token = ?', (token,))
+            c.execute('DELETE FROM token_ips WHERE token = ?', (token,))
+        elif action == 'reset':
+            c.execute('DELETE FROM token_ips WHERE token = ?', (token,))
+        elif action == 'renew':
+            # Renew for 30 days, adjust as needed
+            new_expiry = (datetime.utcnow() + timedelta(days=30)).isoformat()
+            c.execute('UPDATE tokens SET expiry = ?, banned = 0 WHERE token = ?', (new_expiry, token))
+        elif action == 'ban':
+            c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+        elif action == 'unban':
+            c.execute('UPDATE tokens SET banned = 0 WHERE token = ?', (token,))
+        conn.commit()
+    return redirect('/admin')
+
 # ------------------------ M3U PARSER ------------------------ #
 def parse_m3u_lines(lines, c):
     name, logo = None, ''
@@ -164,22 +186,41 @@ def playlist():
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        if c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone():
-            if time.time() < c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()[0]:
-                return render_template('sniffer_blocked.html'), 403
+        blocked_ip_row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
+        if blocked_ip_row and time.time() < blocked_ip_row[0]:
+            return render_template('sniffer_blocked.html'), 403
+
         if is_sniffer(ip, ua):
             log_block(c, ip, token, ua, ref)
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
+
         row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
-        if not row or row[1]:
+        if not row or row[1]: # Token not found or is banned
+            c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                      (datetime.utcnow().isoformat(), ip, token or 'invalid/banned', ua, ref))
+            conn.commit()
             return abort(403, 'Invalid or banned token')
+
+        # Check token expiry
+        expiry_time = datetime.fromisoformat(row[0])
+        if datetime.utcnow() > expiry_time:
+            c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,)) # Ban expired token
+            c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                      (datetime.utcnow().isoformat(), ip, token + ' (expired)', ua, ref))
+            conn.commit()
+            return abort(403, 'Token expired')
+
+        # Device limit check
         if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
             if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
                 c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+                c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                          (datetime.utcnow().isoformat(), ip, token + ' (device limit exceeded)', ua, ref))
                 conn.commit()
                 return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+
         c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)', (datetime.utcnow().isoformat(), ip, token, ua, ref))
         channels = c.execute('SELECT name, stream_url, logo_url FROM channels').fetchall()
         conn.commit()
@@ -200,28 +241,54 @@ def stream():
     channelid = request.args.get('channelid', '').strip()
     ip = request.remote_addr
     ua = request.headers.get('User-Agent', '').lower()
+    ref = request.referrer or '' # Capture referrer for stream requests
 
     with sqlite3.connect(DB) as conn:
         c = conn.cursor()
-        if c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone():
-            if time.time() < c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()[0]:
-                return render_template('sniffer_blocked.html'), 403
+        blocked_ip_row = c.execute("SELECT unblock_time FROM blocked_ips WHERE ip = ?", (ip,)).fetchone()
+        if blocked_ip_row and time.time() < blocked_ip_row[0]:
+            return render_template('sniffer_blocked.html'), 403
+
         if is_sniffer(ip, ua):
-            log_block(c, ip, token, ua, request.referrer or '')
+            log_block(c, ip, token, ua, ref)
             conn.commit()
             return render_template('sniffer_blocked.html'), 403
+
         row = c.execute('SELECT expiry, banned FROM tokens WHERE token = ?', (token,)).fetchone()
-        if not row or row[1]:
+        if not row or row[1]: # Token not found or is banned
+            c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                      (datetime.utcnow().isoformat(), ip, token or 'invalid/banned', ua, ref))
+            conn.commit()
             return abort(403, 'Invalid or banned token')
+
+        # Check token expiry
+        expiry_time = datetime.fromisoformat(row[0])
+        if datetime.utcnow() > expiry_time:
+            c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,)) # Ban expired token
+            c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                      (datetime.utcnow().isoformat(), ip, token + ' (expired)', ua, ref))
+            conn.commit()
+            return abort(403, 'Token expired')
+
+        # Device limit check (only add if not present, don't re-count for existing streams from same IP)
         if not c.execute('SELECT 1 FROM token_ips WHERE token = ? AND ip = ?', (token, ip)).fetchone():
             if c.execute('SELECT COUNT(*) FROM token_ips WHERE token = ?', (token,)).fetchone()[0] >= MAX_DEVICES:
                 c.execute('UPDATE tokens SET banned = 1 WHERE token = ?', (token,))
+                c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+                          (datetime.utcnow().isoformat(), ip, token + ' (device limit exceeded)', ua, ref))
                 conn.commit()
                 return abort(403, 'Device limit exceeded')
             c.execute('INSERT INTO token_ips(token, ip) VALUES (?, ?)', (token, ip))
+
+        # Log stream access (optional, can be verbose)
+        # c.execute('INSERT INTO logs(timestamp, ip, token, user_agent, referrer) VALUES (?, ?, ?, ?, ?)',
+        #           (datetime.utcnow().isoformat(), ip, token + ' (stream)', ua, ref))
+
         for name, url in c.execute('SELECT name, stream_url FROM channels').fetchall():
             if str(uuid.uuid5(uuid.NAMESPACE_URL, url)) == channelid:
+                conn.commit() # Commit any pending changes before redirect
                 return redirect(url)
+        conn.commit() # Commit if no channel found
         return abort(404, 'Stream not found')
 
 # ------------------------ USER UNLOCK PAGE ------------------------ #
