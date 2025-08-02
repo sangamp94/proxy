@@ -14,7 +14,7 @@ app = Flask(__name__)
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 
-# Load configuration
+# Load config
 with open(CONFIG_PATH) as f:
     config = json.load(f)
 
@@ -46,12 +46,17 @@ def download_and_decrypt():
         "--fixup", "never",
         "--merge-output-format", "mp4",
         "--external-downloader", "ffmpeg",
-        "--downloader-args", f'ffmpeg_i:-decryption_key {KEY_ID}:{KEY}',
+        "--downloader-args", f"ffmpeg_i:-decryption_key {KEY_ID}:{KEY}",
         "-o", OUTPUT_MP4,
         MPD_URL
     ]
-    result = subprocess.run(cmd)
-    return result.returncode == 0
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print("[❌] yt-dlp error:")
+        print(result.stderr)
+        return False
+    print("[✅] yt-dlp download complete.")
+    return True
 
 def start_hls_stream():
     global current_process
@@ -72,16 +77,27 @@ def start_hls_stream():
         "-hls_flags", "delete_segments+program_date_time",
         OUTPUT_HLS
     ]
-    current_process = subprocess.Popen(ffmpeg_cmd)
+
+    current_process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print("[✅] FFmpeg process started.")
 
 def manage_stream():
     while True:
-        if not os.path.exists(OUTPUT_HLS):
-            stop_stream()
-            if download_and_decrypt():
-                start_hls_stream()
-        time.sleep(10)
+        try:
+            if not os.path.exists(OUTPUT_HLS):
+                print("[ℹ️] stream.m3u8 not found, preparing stream...")
+                stop_stream()
+                if download_and_decrypt():
+                    start_hls_stream()
+                else:
+                    print("[⚠️] Download failed. Retrying in 20 seconds.")
+            else:
+                print("[📡] HLS stream is live.")
+        except Exception as e:
+            print(f"[❌] Error in stream manager: {e}")
+        time.sleep(20)
 
+# --- Flask Routes ---
 @app.route("/")
 def home():
     return f"{CHANNEL_NAME} HLS Server is running 🎬"
@@ -108,6 +124,6 @@ def status():
     })
 
 if __name__ == "__main__":
-    print("[🚀] Starting Flask HLS server on http://0.0.0.0:10000")
+    print("[🚀] Starting HLS server on http://0.0.0.0:10000")
     threading.Thread(target=manage_stream, daemon=True).start()
     app.run(host="0.0.0.0", port=10000)
